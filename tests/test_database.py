@@ -318,6 +318,29 @@ class TestLifecycle:
         finally:
             await db.dispose()
 
+    async def test_is_reachable_survives_a_failure_type_nobody_enumerated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``Never raises`` means never, including for types we did not list.
+
+        ``is_reachable`` used to catch ``(SQLAlchemyError, OSError, ValueError)``.
+        That list is not closed: on Windows a DSN whose ``?host=`` names a Unix
+        socket directory makes the driver raise ``NotImplementedError``, which is
+        none of the three, so it escaped a method documented as never raising.
+        Raising the same type here reproduces that platform on any host.
+        """
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError("UNIX sockets are not supported on Windows")
+
+        monkeypatch.setattr(AsyncEngine, "connect", refuse)
+
+        db = Database("postgresql+asyncpg://u:p@/mtproto?host=/var/run/postgresql")
+        try:
+            assert await db.is_reachable() is False
+        finally:
+            await db.dispose()
+
     async def test_ping_raises_when_unreachable(self) -> None:
         from sqlalchemy.exc import SQLAlchemyError
 
@@ -399,3 +422,40 @@ class TestDatabaseExists:
         monkeypatch.setattr(Database, "dispose", spy)
         await database_exists("postgresql+asyncpg://u:p@127.0.0.1:1/x", "x")
         assert disposed == [True]
+
+    async def test_returns_false_when_the_driver_rejects_the_dsn_for_platform_reasons(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This is the failure that was invisible everywhere except Windows.
+
+        The DSN below is the shape ``scripts/dev_pg.py`` produces -- a Unix
+        socket directory carried in ``?host=``. Rebuilding it is pure string
+        handling and works on every platform, so the URL test next door passes
+        everywhere. What differs is the *connect*: on Windows the driver refuses
+        Unix sockets outright with ``NotImplementedError``.
+
+        Under the previous ``(SQLAlchemyError, OSError, ValueError)`` handler
+        that exception escaped a function whose docstring promises it never
+        raises. The blast radius is bigger than one test: integration fixtures
+        call ``database_exists`` to decide whether to skip, so on Windows the
+        whole suite would have died during collection instead of skipping.
+        """
+        recorded: list[str] = []
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError("UNIX sockets are not supported on Windows")
+
+        real_init = Database.__init__
+
+        def spy(self: Database, url: str, **init_kwargs: Any) -> None:
+            recorded.append(url)
+            real_init(self, url, **init_kwargs)
+
+        monkeypatch.setattr(Database, "__init__", spy)
+        monkeypatch.setattr(AsyncEngine, "connect", refuse)
+
+        url = "postgresql+asyncpg://u:p@/mtproto?host=/var/run/postgresql"
+        assert await database_exists(url, "mtproto") is False
+
+        # The URL rewrite still happened; only the connection was refused.
+        assert recorded[0].endswith("/postgres?host=/var/run/postgresql")

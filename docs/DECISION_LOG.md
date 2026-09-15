@@ -780,6 +780,59 @@ Two independent guards, different exceptions — both pinned in tests so nobody
 
 ---
 
+### D-033 · Cross-platform failures are reproduced on Linux, not skipped
+
+Two bugs were found only because the suite was run on Windows. Neither was a
+Windows bug in the strict sense — both were *narrow assumptions* that happened to
+hold on the only platform being tested.
+
+**(a) Clock granularity.** `time.monotonic()` on Linux has 1 ns resolution
+(`clock_gettime(CLOCK_MONOTONIC)`); on Windows it advances in ~15.6 ms quanta
+(1/64 s, the system timer tick). A worker loop run with `interval=0.0` finishes
+three ticks in microseconds, so on Windows the measured uptime is *exactly*
+`0.0` and `assert life.uptime_seconds > 0.0` fails.
+
+The test was wrong, not the code: `uptime_seconds` already clamps with
+`max(0.0, ...)`, which documents zero as a legal value. The assertion was
+restated as `>= 0.0`.
+
+**(b) An exception list that was not closed.** `is_reachable()` and
+`database_exists()` both documented "never raises" but caught only
+`(SQLAlchemyError, OSError, ValueError)`. The project's own development DSN
+carries a Unix socket directory in `?host=`, and on Windows the driver refuses
+Unix sockets with `NotImplementedError` — none of the three. The blast radius
+was larger than one test: integration fixtures call `database_exists()` to
+decide whether to skip, so on Windows the whole suite would have died during
+*collection* rather than skipping cleanly.
+
+Both handlers are now `except Exception`. This is not laziness — it is what the
+docstring already promised, and `CancelledError` derives from `BaseException` so
+cooperative cancellation still propagates.
+
+**Rationale.** A guard that only fails on an untested platform is worse than no
+guard, because CI keeps reporting green. So each failure was converted into a
+test that reproduces the platform *here*:
+
+| Platform condition | Reproduced on Linux by |
+|---|---|
+| 15.6 ms monotonic quanta | `monkeypatch`ing `time.monotonic` to `int(t / 0.015625) * 0.015625` |
+| Driver rejecting a Unix-socket DSN | `monkeypatch`ing `AsyncEngine.connect` to raise `NotImplementedError` |
+
+Both are exact stand-ins for the real thing, so `test_survives_a_coarse_monotonic_clock`,
+`test_is_reachable_survives_a_failure_type_nobody_enumerated` and
+`test_returns_false_when_the_driver_rejects_the_dsn_for_platform_reasons` now run
+in every CI job rather than only on the machine that discovered them. Running the
+whole unit suite under the quantised clock yields **498 passed** — the same as
+without it, which is the point.
+
+**Consequences.** `ping()`'s docstring now states the failure-type list is
+open-ended and points at `is_reachable()` as the safe entry point, so the next
+caller does not re-derive a three-type `except` and reintroduce the bug.
+`scripts/dev_pg.py` remains unverified on Windows — it drives `pgserver`'s Unix
+socket path, and nothing in this decision claims otherwise.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |

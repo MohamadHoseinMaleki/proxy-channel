@@ -28,7 +28,6 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -211,16 +210,32 @@ class Database:
         not hypothetical: a refused TCP connection surfaces as a bare
         ``ConnectionRefusedError`` rather than being wrapped by the dialect, so
         callers must not assume ``except SQLAlchemyError`` is sufficient.
-        :meth:`is_reachable` catches both and is the safe entry point.
+
+        Nor is that pair the whole story. The driver rejects some DSNs for
+        platform reasons that are neither -- a ``?host=`` naming a Unix socket
+        directory raises ``NotImplementedError`` on Windows. Treat the list of
+        failure types as open-ended and use :meth:`is_reachable`, which catches
+        ``Exception``, as the safe entry point.
         """
         async with self._engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
 
     async def is_reachable(self) -> bool:
-        """Whether the database answered a trivial query. Never raises."""
+        """Whether the database answered a trivial query. Never raises.
+
+        The handler is deliberately ``Exception`` rather than a tidy list of
+        driver errors, because this method *promises* never to raise and no such
+        list is closed. A DSN whose ``?host=`` names a Unix socket directory is
+        the concrete case: on Windows the driver rejects it with
+        ``NotImplementedError``, which is none of ``SQLAlchemyError``,
+        ``OSError`` or ``ValueError``. Callers use the answer to decide whether
+        to skip, so an escaping exception turns a clean skip into a loud failure
+        -- on a platform nobody was testing. ``CancelledError`` derives from
+        ``BaseException`` and therefore still propagates, as it must.
+        """
         try:
             await self.ping()
-        except (SQLAlchemyError, OSError, ValueError) as exc:
+        except Exception as exc:
             _logger.debug(
                 "database_unreachable", url=self.safe_url, exception_type=type(exc).__name__
             )
@@ -272,7 +287,13 @@ async def database_exists(url: str, database: str) -> bool:
                 {"name": database},
             )
             return result.scalar_one_or_none() is not None
-    except (SQLAlchemyError, OSError, ValueError):
+    except Exception as exc:
+        # ``Exception``, not a list of driver errors: see :meth:`Database.is_reachable`.
+        # The docstring above is a contract -- callers are fixtures deciding whether to
+        # skip, so a platform-specific rejection that escapes here becomes a collection
+        # error instead of a clean skip. CancelledError is a BaseException and still
+        # propagates.
+        _logger.debug("database_exists_probe_failed", exception_type=type(exc).__name__)
         return False
     finally:
         await probe.dispose()

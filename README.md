@@ -84,8 +84,8 @@ src/
 
 alembic/                     # async migrations; no DSN in alembic.ini
 scripts/dev_pg.py            # local PostgreSQL without Docker (pgserver, ad hoc)
-tests/                       # 493 unit tests; no network, no database
-tests/integration/           # 161 tests against a real PostgreSQL 16
+tests/                       # 498 unit tests; no network, no database
+tests/integration/           # 163 tests against a real PostgreSQL 16
 spike/                       # protocol engine evaluation + its audit
 docs/DATABASE.md             # schema, identity, secrets, claiming, indexes
 docs/DECISION_LOG.md         # every constraining decision, with evidence
@@ -101,24 +101,39 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 493 passed, 161 skipped (no database)
+uv run pytest                  # 498 passed, 163 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # 34 files already formatted
 uv run mypy .                  # Success: no issues found in 31 source files
 ```
 
-To also run the 161 integration tests, provision a local PostgreSQL — Docker is
+To also run the 163 integration tests, provision a local PostgreSQL — Docker is
 **not** required:
 
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 654 passed
+                               # 661 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any
 other PostgreSQL works too — point `DATABASE_URL` at it and skip the script. See
 [docs/DATABASE.md](docs/DATABASE.md).
+
+**Platform notes.** The 498 unit tests are cross-platform and verified on both
+Linux and Windows — no database, no network, no filesystem assumptions. The 163
+integration tests need a real PostgreSQL; without one they **skip with a
+message**, they never fail. `scripts/dev_pg.py` has only been exercised on Linux,
+so on Windows point `DATABASE_URL` at a PostgreSQL you installed yourself:
+
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://user:pass@localhost:5432/mtproto"
+uv run alembic upgrade head
+uv run pytest -m integration
+```
+
+See [D-033](docs/DECISION_LOG.md) for the two Windows-only bugs this uncovered
+and how they are now reproduced on Linux so CI catches them.
 
 ### Run the workers
 

@@ -14,6 +14,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -119,7 +120,54 @@ class TestRunLoop:
         assert seen == [1, 2, 3]
         assert life.failure_count == 0
         assert life.shutdown_reason == "enough"
-        assert life.uptime_seconds > 0.0
+        # ``>= 0.0``, not ``> 0.0``. With ``interval=0.0`` three ticks complete
+        # faster than the monotonic clock advances on some platforms, so the
+        # measured uptime is legitimately zero: on Windows ``time.monotonic()``
+        # moves in ~15.6 ms quanta. ``uptime_seconds`` already documents this by
+        # clamping with ``max(0.0, ...)``, so a strict ``>`` was asserting a
+        # property the code never promised. See
+        # ``test_survives_a_coarse_monotonic_clock`` for the guarded version.
+        assert life.uptime_seconds >= 0.0
+
+    async def test_survives_a_coarse_monotonic_clock(
+        self, fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loop must stay correct when the clock cannot measure it.
+
+        Regression guard for a Windows-only failure. ``time.monotonic()`` there
+        advances in ~15.6 ms quanta, so a loop running with ``interval=0.0``
+        completes several ticks without the clock moving at all and the measured
+        uptime is exactly ``0.0``. An earlier ``> 0.0`` assertion failed on
+        Windows while passing on every other platform -- the worst kind of bug,
+        because the machine that trips over it is not the machine running CI.
+
+        Quantising the clock reproduces that platform here, on any host, so the
+        guard runs everywhere instead of only where it was discovered.
+        """
+        real_monotonic = time.monotonic
+        quantum = 0.015625  # 1/64 s -- the classic Windows system timer tick
+
+        def coarse() -> float:
+            return int(real_monotonic() / quantum) * quantum
+
+        monkeypatch.setattr(time, "monotonic", coarse)
+
+        seen: list[int] = []
+
+        async def tick(life: WorkerLifecycle) -> None:
+            seen.append(life.tick_count)
+            if len(seen) >= 3:
+                life.request_shutdown("enough")
+
+        life = WorkerLifecycle("discovery", settings=fast_settings)
+        await life.run(tick, interval=0.0)
+
+        # The clock stood still; the loop's own bookkeeping must not have.
+        assert seen == [1, 2, 3]
+        assert life.tick_count == 3
+        assert life.failure_count == 0
+        assert life.shutdown_reason == "enough"
+        assert life.uptime_seconds >= 0.0
 
     async def test_stops_immediately_if_shutdown_already_requested(
         self, fast_settings: Settings
