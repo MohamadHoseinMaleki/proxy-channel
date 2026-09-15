@@ -930,12 +930,47 @@ deferred table for Task 004 instead of being rediscovered there.
 
 ---
 
+### D-035 · Discovery, parsing, secret taxonomy, and SSRF architecture
+
+Task 003 implements the discovery layer (`src/modules/discovery`). Key decisions:
+
+1. **Domain Model (`MTProtoProxy`):**
+   * Immutable dataclass with `slots=True`.
+   * Directly uses `core.identity.ProxySecret` for the secret; `repr` and `str` never expose plaintext.
+   * `server` is automatically canonicalised (`normalize_server`) and `fingerprint` is precomputed on initialization.
+   * Preserves fake-TLS `sni_domain` and `SecretType` for downstream tester use.
+
+2. **Parsing Rules:**
+   * Accepts `tg://proxy?...`, `https://t.me/proxy?...`, and `http://t.me/proxy?...`.
+   * Reordered query parameters yield the identical canonical proxy identity.
+   * Duplicate parameters with identical values are tolerated; conflicting values raise `ProxyParseError`.
+   * HTML unescaping and trailing punctuation stripping allow safe extraction from raw text and HTML attributes.
+   * Parser never crashes on malformed external input and exception messages are strictly scrubbed of secrets.
+
+3. **Secret Validation:**
+   * MTProto secrets are decoded (hex first, then base64 fallback).
+   * Categorised strictly into `LEGACY` (16 bytes), `SECURE_RANDOMIZED` (17 bytes starting `0xdd`), and `FAKE_TLS` (>=17 bytes starting `0xee`).
+   * For `FAKE_TLS`, trailing bytes are decoded as ASCII and validated against hostname rules.
+   * Telethon >= 1.35.0 transport limitation is documented: it normalises `ee` secrets by truncating to 16 bytes and dropping SNI, so wire-level fake-TLS connectivity remains empirically unverified until live testing in Task 005.
+
+4. **Server Validation & SSRF Protection:**
+   * Server strings are validated syntactically without DNS resolution during parsing.
+   * Disallows loopback, RFC 1918 private, link-local (including 169.254.169.254), multicast, unspecified, documentation, and internal domains (`.localhost`, `.local`, `.internal`).
+   * `SsrfSafeHttpClient` performs DNS resolution before connecting and after every redirect hop to block SSRF and DNS rebinding to internal networks.
+
+5. **Persistence & Lifecycle:**
+   * Uses PostgreSQL `INSERT INTO proxies ... ON CONFLICT (fingerprint) DO UPDATE`.
+   * Discovery sets `is_active=True`, `last_seen_at=now`, and `next_test_at=now`.
+   * Discovery **never** sets `WORKING` status or generates fake observations; network health is strictly the tester's responsibility.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |
 |---|---|
 | ~~PostgreSQL models, indexes, Alembic migrations, fingerprint uniqueness~~ | **002 — delivered** |
-| `MTProtoProxy` domain type, link parsing, deterministic fingerprinting | 003 |
+| ~~`MTProtoProxy` domain type, link parsing, deterministic fingerprinting, discovery layer~~ | **003 — delivered** |
 | `SourceFetcher` abstraction, source health metadata — and with it the D-034 question of whether `ProxySource` becomes a first-class table instead of inline provenance on `proxy_discoveries` | 004, 018 |
 | Telethon transport wrapper, three-phase test, error taxonomy, resource safety | 005 |
 | Claim primitive with `FOR UPDATE SKIP LOCKED` shipped in 002 (D-024); bounded concurrency and worker wiring remain | 006, 014 |
