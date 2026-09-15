@@ -31,6 +31,7 @@ from structlog.types import EventDict, Processor, WrappedLogger
 from core.config import Settings, get_settings
 
 __all__ = [
+    "DEFAULT_ERROR_MESSAGE_LIMIT",
     "REDACTED",
     "SENSITIVE_KEY_PATTERN",
     "bind_worker_context",
@@ -38,6 +39,8 @@ __all__ = [
     "get_logger",
     "redact",
     "redact_secrets",
+    "safe_error_message",
+    "scrub_secrets",
     "unbind_worker_context",
 ]
 
@@ -74,12 +77,32 @@ _DSN_PASSWORD_PATTERN = r"(?i)\b([a-z][a-z0-9+.\-]*://[^:/@\s]+:)([^@\s/]+)(@)" 
 # Telegram Bot API tokens embedded in a request URL path: ``/bot<id>:<token>/``.
 _BOT_TOKEN_PATTERN = r"(?i)\b(bot\d{5,}:)([A-Za-z0-9_\-]{25,})"  # noqa: S105
 
+# A bare run of 32+ hex characters: an MTProto secret is 16 bytes (32 hex
+# digits), usually ``ee``-prefixed, and a fake-TLS one is longer still.
+#
+# This pattern exists because key-based matching cannot reach it. When a CHECK
+# constraint rejects a row, PostgreSQL appends ``DETAIL: Failing row contains
+# (...)`` and echoes *every column*, so the secret arrives with no ``secret=``
+# key in front of it -- verified against a real server, not assumed. The same
+# happens for exclusion/unique violation detail and for NOTICE output.
+#
+# The cost is that 64-character proxy fingerprints are masked in error text too.
+# Accepted deliberately: a fingerprint is derivable from the row and rarely
+# belongs in an error message, whereas a secret in one is a credential leak that
+# lands in log aggregators and in ``proxy_observations.error_message_safe``.
+_HEX_SECRET_PATTERN = r"\b[0-9a-fA-F]{32,}\b"  # noqa: S105
+
 _MAX_REDACTION_DEPTH = 12
+
+#: Hard cap on persisted error text. Mirrors the CHECK constraint on
+#: ``proxy_observations.error_message_safe``; keep the two in sync.
+DEFAULT_ERROR_MESSAGE_LIMIT = 500
 
 _KEY_RE = re.compile(SENSITIVE_KEY_PATTERN, re.IGNORECASE)
 _EMBEDDED_RE = re.compile(_EMBEDDED_SECRET_PATTERN)
 _DSN_RE = re.compile(_DSN_PASSWORD_PATTERN)
 _BOT_TOKEN_RE = re.compile(_BOT_TOKEN_PATTERN)
+_HEX_SECRET_RE = re.compile(_HEX_SECRET_PATTERN)
 
 _configured = False
 
@@ -116,7 +139,53 @@ def _is_sensitive_key(key: str) -> bool:
 def _scrub_string(value: str) -> str:
     value = _EMBEDDED_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", value)
     value = _DSN_RE.sub(lambda m: f"{m.group(1)}{REDACTED}{m.group(3)}", value)
-    return _BOT_TOKEN_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", value)
+    value = _BOT_TOKEN_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", value)
+    # Last: the REDACTED marker itself contains no hex run, so masking bare
+    # secrets cannot corrupt an earlier substitution.
+    return _HEX_SECRET_RE.sub(REDACTED, value)
+
+
+def scrub_secrets(text: str) -> str:
+    """Mask credentials embedded inside a single string.
+
+    Public wrapper around the value-level scrubber used by :func:`redact`.
+    Exposed because sanitisation is needed in two places that must agree exactly:
+    log output, and the ``error_message_safe`` column persisted with every
+    :class:`~core.models.ProxyObservation`. Sharing one implementation means a
+    pattern fixed in one place cannot leak through the other.
+    """
+    return _scrub_string(text)
+
+
+def safe_error_message(
+    value: BaseException | str | None, *, limit: int = DEFAULT_ERROR_MESSAGE_LIMIT
+) -> str | None:
+    """Build a persistable, secret-free error message.
+
+    Deliberately keeps only ``"<ExceptionType>: <message>"`` -- never a traceback
+    (``core.models`` enforces a length cap at the database level too). The result
+    is passed through :func:`scrub_secrets` so a secret that reached an exception
+    message cannot be written to ``proxy_observations``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, BaseException):
+        # An exception raised with no message is common (`raise TimeoutError`,
+        # a bare `CancelledError`). The type name is then the only diagnostic
+        # available, so keep it rather than returning None -- but drop the
+        # dangling colon that a naive f-string would leave behind.
+        name = type(value).__name__
+        detail = str(value).strip()
+        text = f"{name}: {detail}" if detail else name
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+    text = " ".join(text.split())  # collapse newlines/traceback-ish whitespace
+    scrubbed = scrub_secrets(text)
+    if len(scrubbed) > limit:
+        return scrubbed[: limit - 1].rstrip() + "\u2026"
+    return scrubbed
 
 
 def redact(value: Any, *, _depth: int = 0) -> Any:

@@ -13,12 +13,15 @@ from typing import Any
 import pytest
 
 from core.logger import (
+    DEFAULT_ERROR_MESSAGE_LIMIT,
     REDACTED,
     bind_worker_context,
     configure_logging,
     get_logger,
     redact,
     redact_secrets,
+    safe_error_message,
+    scrub_secrets,
     unbind_worker_context,
 )
 
@@ -266,3 +269,235 @@ class TestConfiguredOutput:
         get_logger("workers.discovery").info("discovery_completed", proxies_found=1)
         records = parse_lines(json_logs)
         assert isinstance(records[0], dict)
+
+
+class TestScrubSecrets:
+    """String-level scrubbing.
+
+    Shared with :func:`safe_error_message` on purpose: the same patterns protect
+    log output and the ``error_message_safe`` column, so a fix in one place
+    cannot leak through the other.
+    """
+
+    def test_masks_a_dsn_password(self) -> None:
+        text = "postgresql+asyncpg://mtproto:sup3r-s3cret@db.example.com/mtproto"
+        scrubbed = scrub_secrets(text)
+        assert "sup3r-s3cret" not in scrubbed
+        assert REDACTED in scrubbed
+
+    def test_keeps_the_non_secret_parts_of_a_dsn(self) -> None:
+        text = "postgresql+asyncpg://mtproto:sup3r-s3cret@db.example.com:5432/mtproto"
+        scrubbed = scrub_secrets(text)
+        for keep in ("db.example.com", "5432", "mtproto"):
+            assert keep in scrubbed
+
+    def test_masks_a_url_of_any_scheme(self) -> None:
+        # Not just postgresql:// -- a misconfigured DSN of any kind lands in an
+        # error message.
+        for text in (
+            "mysql+asyncmy://u:sup3r-s3cret@h/db",
+            "http://u:sup3r-s3cret@proxy.example.com:8080",
+            "redis://u:sup3r-s3cret@h:6379/0",
+        ):
+            assert "sup3r-s3cret" not in scrub_secrets(text), text
+
+    def test_masks_an_embedded_mtproto_secret_parameter(self) -> None:
+        # tg://proxy links carry the secret as a query parameter; discovery logs
+        # the raw channel message, so this path is reachable.
+        secret = "ee" + "a1" * 15
+        text = f"tg://proxy?server=1.2.3.4&port=443&secret={secret}"
+        scrubbed = scrub_secrets(text)
+        assert secret not in scrubbed
+        assert "server=1.2.3.4" in scrubbed
+
+    @pytest.mark.parametrize("prefix", ["secret=", "password=", "token=", "api_key=", "api_hash="])
+    def test_masks_known_embedded_keys(self, prefix: str) -> None:
+        assert "hunter2" not in scrub_secrets(f"{prefix}hunter2 trailing")
+
+    def test_masks_a_bot_token_in_a_url_path(self) -> None:
+        token = "A" * 35
+        text = f"https://api.telegram.org/bot123456:{token}/getMe"
+        assert token not in scrub_secrets(text)
+
+    def test_is_idempotent(self) -> None:
+        text = "postgresql://u:sup3r-s3cret@h/db"
+        assert scrub_secrets(scrub_secrets(text)) == scrub_secrets(text)
+
+    def test_leaves_ordinary_text_alone(self) -> None:
+        for text in (
+            "connected to proxy.example.com:443",
+            "error_category=DNS_ERROR",
+            "claim_due_proxies returned 12 rows",
+            "",
+        ):
+            assert scrub_secrets(text) == text
+
+    def test_does_not_mask_a_column_named_source_url(self) -> None:
+        # `url` is not in the sensitive-key list; `source_url` is provenance, not
+        # a credential, and masking it would destroy debugging value.
+        assert scrub_secrets("source_url=https://t.me/some_channel") == (
+            "source_url=https://t.me/some_channel"
+        )
+
+
+class TestSafeErrorMessage:
+    """The value persisted into ``proxy_observations.error_message_safe``."""
+
+    def test_none_passes_through(self) -> None:
+        assert safe_error_message(None) is None
+
+    def test_exception_becomes_type_and_message(self) -> None:
+        assert safe_error_message(TimeoutError("handshake timed out")) == (
+            "TimeoutError: handshake timed out"
+        )
+
+    def test_plain_string_is_preserved(self) -> None:
+        assert safe_error_message("something failed") == "something failed"
+
+    def test_empty_string_becomes_none(self) -> None:
+        assert safe_error_message("") is None
+        assert safe_error_message("   ") is None
+
+    def test_an_exception_with_no_message_keeps_its_type(self) -> None:
+        # The type name is the only diagnostic available for a bare `raise
+        # TimeoutError`, so dropping it would lose real information -- but the
+        # dangling colon from a naive f-string must not survive.
+        assert safe_error_message(ValueError()) == "ValueError"
+        assert safe_error_message(TimeoutError()) == "TimeoutError"
+        rendered = safe_error_message(ValueError())
+        assert rendered is not None
+        assert not rendered.endswith(":")
+
+    def test_scrubs_a_secret_out_of_an_exception_message(self) -> None:
+        secret = "ee" + "a1" * 15
+        message = safe_error_message(RuntimeError(f"failed to connect with secret={secret}"))
+        assert message is not None
+        assert secret not in message
+
+    def test_scrubs_a_dsn_out_of_an_exception_message(self) -> None:
+        message = safe_error_message(
+            OSError("could not connect to postgresql://u:sup3r-s3cret@h/db")
+        )
+        assert message is not None
+        assert "sup3r-s3cret" not in message
+
+    def test_collapses_newlines_so_a_traceback_stays_one_line(self) -> None:
+        message = safe_error_message(RuntimeError("line one\nline two\n\nline three"))
+        assert message == "RuntimeError: line one line two line three"
+        assert "\n" not in message
+
+    def test_respects_the_default_limit(self) -> None:
+        message = safe_error_message(RuntimeError("x" * 5000))
+        assert message is not None
+        assert len(message) <= DEFAULT_ERROR_MESSAGE_LIMIT
+
+    def test_respects_an_explicit_limit(self) -> None:
+        message = safe_error_message("y" * 500, limit=40)
+        assert message is not None
+        assert len(message) <= 40
+
+    def test_truncation_is_marked(self) -> None:
+        message = safe_error_message("z" * 5000, limit=40)
+        assert message is not None
+        assert message.endswith("\u2026")
+
+    def test_short_messages_are_not_truncated(self) -> None:
+        assert safe_error_message("fine", limit=100) == "fine"
+
+    def test_default_limit_matches_the_database_check_constraint(self) -> None:
+        # core.models mirrors this constant into a CHECK constraint; if they
+        # diverge the database starts rejecting rows the app thought were valid.
+        from core.models import ERROR_MESSAGE_MAX_LENGTH
+
+        assert DEFAULT_ERROR_MESSAGE_LIMIT == ERROR_MESSAGE_MAX_LENGTH
+
+    def test_exception_type_is_preserved_for_subclasses(self) -> None:
+        class CustomMessageError(RuntimeError):
+            pass
+
+        message = safe_error_message(CustomMessageError("nope"))
+        assert message is not None
+        assert message.startswith("CustomMessageError:")
+
+    def test_base_exceptions_are_handled(self) -> None:
+        # CancelledError is a BaseException, not an Exception; a worker shutdown
+        # can reach here with one, and `except Exception` handling would miss it.
+        import asyncio
+
+        assert safe_error_message(asyncio.CancelledError()) == "CancelledError"
+        assert safe_error_message(KeyboardInterrupt()) == "KeyboardInterrupt"
+
+
+class TestBareHexScrubbing:
+    """Secrets that arrive with no key in front of them.
+
+    When a CHECK constraint rejects a row, PostgreSQL appends
+    ``DETAIL: Failing row contains (...)`` and echoes every column, so a stored
+    MTProto secret reaches an exception message bare. Key-based patterns cannot
+    match that; this class pins the shape-based fallback that can.
+    """
+
+    def test_masks_a_bare_mtproto_secret(self) -> None:
+        secret = "ee" + "a1" * 15  # 32 hex chars, the canonical 16-byte form
+        assert secret not in scrub_secrets(secret)
+        assert scrub_secrets(secret) == REDACTED
+
+    def test_masks_a_longer_fake_tls_secret(self) -> None:
+        secret = "ee" + "b2" * 15 + "676f6f676c652e636f6d"
+        assert secret not in scrub_secrets(secret)
+
+    def test_masks_uppercase_hex(self) -> None:
+        secret = ("EE" + "A1" * 15).upper()
+        assert secret not in scrub_secrets(secret)
+
+    def test_masks_a_fingerprint_too(self) -> None:
+        # The documented cost of the pattern: 64-char fingerprints are masked in
+        # error text as well. Accepted -- a fingerprint is derivable from the row
+        # and rarely belongs in an error message; a secret leak is not recoverable.
+        assert "f" * 64 not in scrub_secrets("f" * 64)
+
+    @pytest.mark.parametrize("length", [1, 8, 16, 30, 31])
+    def test_leaves_short_hex_alone(self, length: int) -> None:
+        # Ports, ids, latency values and short hashes stay readable; masking them
+        # would gut ordinary debugging output.
+        value = "a" * length
+        assert scrub_secrets(value) == value
+
+    def test_thirty_two_characters_is_the_boundary(self) -> None:
+        assert scrub_secrets("a" * 31) == "a" * 31
+        assert "a" * 32 not in scrub_secrets("a" * 32)
+
+    def test_masks_inside_a_postgres_check_violation_detail(self) -> None:
+        # Shaped like real server output, verified against PostgreSQL 16.
+        secret = "ee" + "a1" * 15
+        raw = (
+            'new row for relation "proxies" violates check constraint '
+            '"ck_proxies_port_range" DETAIL: Failing row contains '
+            f"(1, mtproto, proxy.example.com, 0, {secret}, {'b' * 64}, t)."
+        )
+        scrubbed = scrub_secrets(raw)
+        assert secret not in scrubbed
+        assert "b" * 64 not in scrubbed
+        # The diagnostic parts survive, so the message is still actionable.
+        assert "ck_proxies_port_range" in scrubbed
+        assert "proxy.example.com" in scrubbed
+
+    def test_masks_every_secret_in_a_message_not_just_the_first(self) -> None:
+        first, second = "ee" + "a1" * 15, "ee" + "c3" * 15
+        scrubbed = scrub_secrets(f"tried {first} then {second}")
+        assert first not in scrubbed
+        assert second not in scrubbed
+
+    def test_does_not_corrupt_the_redaction_marker(self) -> None:
+        # The marker contains no 32+ hex run, so ordering the hex pass last
+        # cannot double-substitute or shred earlier replacements.
+        once = scrub_secrets("secret=" + "ee" + "a1" * 15)
+        assert scrub_secrets(once) == once
+        assert REDACTED in once
+
+    def test_a_hex_run_embedded_in_a_longer_word_is_not_split(self) -> None:
+        # \b boundaries mean alphanumerics either side keep it out of scope,
+        # which stops mangling ordinary identifiers.
+        assert scrub_secrets("prefix_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_suffix") == (
+            "prefix_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_suffix"
+        )

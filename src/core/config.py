@@ -34,6 +34,32 @@ DEFAULT_DEV_DATABASE_URL = "postgresql+asyncpg://mtproto:mtproto@localhost:5432/
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 
+def _normalise_async_url(url: str) -> str:
+    """Rewrite a bare ``postgresql://`` DSN to the asyncpg driver."""
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
+def _derive_test_url(url: str) -> str:
+    """Append ``_test`` to the database component of a DSN.
+
+    Handled with :mod:`urllib.parse` rather than string surgery because DSNs may
+    carry query parameters (asyncpg uses ``?host=<socket dir>`` for Unix sockets)
+    and those must survive untouched.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    database = (parts.path or "/").lstrip("/")
+    if not database:
+        msg = f"Cannot derive a test database name from DSN with an empty path: {url!r}"
+        raise ValueError(msg)
+    if database.endswith("_test"):
+        return url
+    return urlunsplit(parts._replace(path=f"/{database}_test"))
+
+
 class Environment(StrEnum):
     """Deployment environment. Drives logging format and config strictness."""
 
@@ -80,7 +106,20 @@ class Settings(BaseSettings):
     db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
     #: Recycle connections before PostgreSQL/managed providers drop them silently.
     db_pool_recycle_seconds: int = Field(default=1800, ge=-1)
+    #: Liveness check on pool checkout. Long-lived workers against managed
+    #: PostgreSQL routinely find connections the provider already closed.
+    db_pool_pre_ping: bool = Field(default=True)
+    #: Keep bind parameters out of SQLAlchemy exception messages. This schema
+    #: stores an MTProto secret in plaintext, so a failing INSERT would otherwise
+    #: put it in an exception string that gets logged and persisted. Debug only.
+    db_hide_parameters: bool = Field(default=True)
     db_echo: bool = Field(default=False)
+
+    #: Separate DSN for the ``integration`` test suite. The migration lifecycle
+    #: test runs ``downgrade base``, which DROPS EVERY TABLE, so it must never
+    #: point at a working database by accident. When unset it is derived from
+    #: ``database_url`` by suffixing the database name with ``_test``.
+    test_database_url: SecretStr | None = Field(default=None)
 
     # --- Worker lifecycle --------------------------------------------------
     shutdown_grace_seconds: float = Field(default=10.0, ge=0)
@@ -165,11 +204,34 @@ class Settings(BaseSettings):
 
         Deliberately not exposed via ``__repr__`` or ``safe_dump``.
         """
-        url = self.database_url.get_secret_value()
-        if url.startswith("postgresql://"):
-            # Normalise to the async driver; asyncpg is the only supported engine.
-            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return url
+        # Normalise to the async driver; asyncpg is the only supported engine.
+        return _normalise_async_url(self.database_url.get_secret_value())
+
+    @property
+    def resolved_test_url(self) -> str:
+        """The DSN integration tests should use, as a plain string.
+
+        Resolution order:
+
+        1. ``TEST_DATABASE_URL`` when set -- explicit always wins.
+        2. Otherwise ``DATABASE_URL`` with ``_test`` appended to the database
+           name, so a contributor's development data is never the target.
+
+        Refuses to resolve at all when ``ENV=production`` and no explicit test
+        DSN was given: a production database must never be a test target by
+        inference.
+        """
+        if self.test_database_url is not None:
+            return _normalise_async_url(self.test_database_url.get_secret_value())
+
+        url = self.sqlalchemy_url
+        if self.is_production:
+            msg = (
+                "TEST_DATABASE_URL must be set explicitly when ENV=production; "
+                "refusing to derive a test DSN from a production database."
+            )
+            raise ValueError(msg)
+        return _derive_test_url(url)
 
     def safe_dump(self) -> dict[str, Any]:
         """A loggable view of the settings with every credential masked."""

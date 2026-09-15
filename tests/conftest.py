@@ -35,7 +35,10 @@ CONFIG_ENV_VARS = (
     "DB_MAX_OVERFLOW",
     "DB_POOL_TIMEOUT_SECONDS",
     "DB_POOL_RECYCLE_SECONDS",
+    "DB_POOL_PRE_PING",
+    "DB_HIDE_PARAMETERS",
     "DB_ECHO",
+    "TEST_DATABASE_URL",
     "SHUTDOWN_GRACE_SECONDS",
     "HEARTBEAT_INTERVAL_SECONDS",
     "WORKER_POLL_INTERVAL_SECONDS",
@@ -85,3 +88,51 @@ def console_logs(capsys: pytest.CaptureFixture[str]) -> pytest.CaptureFixture[st
     """Configure human-readable console logging for output assertions."""
     configure_logging(make_settings(log_format="console", log_level="DEBUG"), force=True)
     return capsys
+
+
+# ---------------------------------------------------------------------------
+# Typed accessors for SQLAlchemy internals
+#
+# These exist so the test suite can assert on engine and schema details without
+# scattering `type: ignore` comments. Each one narrows a real runtime type that
+# SQLAlchemy's own annotations describe more loosely.
+# ---------------------------------------------------------------------------
+
+
+def queue_pool(engine: Any) -> Any:
+    """Narrow ``engine.pool`` to ``QueuePool``.
+
+    ``size()``, ``checkedout()`` and the overflow/timeout/recycle settings live on
+    ``QueuePool``; ``engine.pool`` is annotated as the ``Pool`` base class, which
+    does not declare them. Every engine this project builds uses a QueuePool.
+    """
+    from sqlalchemy.pool import QueuePool
+
+    pool = engine.pool
+    assert isinstance(pool, QueuePool), f"expected QueuePool, got {type(pool).__name__}"
+    return pool
+
+
+def table_of(model: type[Any]) -> Any:
+    """The ``Table`` for a declarative model, reached through metadata.
+
+    ``Model.__table__`` is annotated as ``FromClause``, so ``.indexes`` and
+    ``.constraints`` are invisible to mypy. ``MetaData.tables`` returns a proper
+    ``Table``.
+    """
+    from sqlalchemy import Table
+
+    table = model.metadata.tables[model.__tablename__]
+    assert isinstance(table, Table)
+    return table
+
+
+def string_length(column: Any) -> int:
+    """The declared width of a string column.
+
+    ``Column.type`` is annotated as ``TypeEngine``, which has no ``length``.
+    """
+    from sqlalchemy import String
+
+    assert isinstance(column.type, String), f"{column.name} is {type(column.type).__name__}"
+    return int(column.type.length or 0)

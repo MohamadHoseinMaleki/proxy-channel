@@ -71,15 +71,23 @@ src/
 ├── core/                    # shared infrastructure
 │   ├── config.py            # Pydantic Settings; SecretStr for credentials
 │   ├── logger.py            # structlog + mandatory secret redaction
-│   └── lifecycle.py         # signals, graceful shutdown, the worker loop
+│   ├── lifecycle.py         # signals, graceful shutdown, the worker loop
+│   ├── identity.py          # proxy fingerprinting, normalisation, ProxySecret
+│   ├── models.py            # SQLAlchemy 2.x ORM: 4 tables, constraints, indexes
+│   └── database.py          # async engine, session_scope, teardown
 ├── modules/                 # domain logic (populated by Tasks 003–012)
+│   └── scheduling.py        # FOR UPDATE SKIP LOCKED claim primitive
 └── workers/
     ├── discovery.py         # Process A — placeholder
     ├── tester.py            # Process B — placeholder
     └── scorer.py            # Process C — placeholder
 
-tests/                       # 162 unit tests; no network, no database
+alembic/                     # async migrations; no DSN in alembic.ini
+scripts/dev_pg.py            # local PostgreSQL without Docker (pgserver, ad hoc)
+tests/                       # 493 unit tests; no network, no database
+tests/integration/           # 161 tests against a real PostgreSQL 16
 spike/                       # protocol engine evaluation + its audit
+docs/DATABASE.md             # schema, identity, secrets, claiming, indexes
 docs/DECISION_LOG.md         # every constraining decision, with evidence
 ```
 
@@ -93,11 +101,24 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 162 passed
+uv run pytest                  # 493 passed, 161 skipped (no database)
 uv run ruff check .            # All checks passed
-uv run ruff format --check .   # 17 files already formatted
-uv run mypy .                  # Success: no issues found in 15 source files
+uv run ruff format --check .   # 34 files already formatted
+uv run mypy .                  # Success: no issues found in 31 source files
 ```
+
+To also run the 161 integration tests, provision a local PostgreSQL — Docker is
+**not** required:
+
+```bash
+uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
+uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
+                               # 654 passed
+```
+
+`pgserver` is fetched ad hoc and is never added to the project dependencies. Any
+other PostgreSQL works too — point `DATABASE_URL` at it and skip the script. See
+[docs/DATABASE.md](docs/DATABASE.md).
 
 ### Run the workers
 
@@ -150,6 +171,9 @@ case-insensitive and a `.env` file is read automatically.
 | `LOG_FORMAT` | *(derived)* | `console` in development, `json` otherwise |
 | `DATABASE_URL` | local dev DSN | `postgresql://` is normalised to `postgresql+asyncpg://` |
 | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_RECYCLE_SECONDS`, `DB_ECHO` | see `.env.example` | `DB_ECHO=true` is rejected in production |
+| `DB_POOL_PRE_PING` | `true` | validates pooled connections; a stale one would otherwise surface as an `InterfaceError` mid-loop |
+| `DB_HIDE_PARAMETERS` | `true` | keeps bind values out of exception text — this schema stores a secret in plaintext. Debug only |
+| `TEST_DATABASE_URL` | *(derived)* | `DATABASE_URL` with `_test` suffixed. **Mandatory** under `ENV=production`, where derivation is refused |
 | `SHUTDOWN_GRACE_SECONDS` | `10` | |
 | `HEARTBEAT_INTERVAL_SECONDS` | `60` | `0` disables heartbeats |
 | `WORKER_POLL_INTERVAL_SECONDS` | `5` | idle delay between ticks |
@@ -162,9 +186,18 @@ defined yet — they arrive with Tasks 005, 009, 011 and 013.
 
 Credentials are typed `SecretStr`, so `repr(Settings)` cannot leak the database
 password. Logging adds a redaction processor that masks credential-shaped keys
-**and** scrubs `secret=…` parameters, DSN passwords and `/bot<token>/` URLs from
-any string — including inside exception tracebacks. See
-[D-008](docs/DECISION_LOG.md). `.env` is git-ignored; `.env.example` is not.
+**and** scrubs `secret=…` parameters, DSN passwords, `/bot<token>/` URLs and any
+bare run of ≥32 hex characters from any string — including inside exception
+tracebacks and pytest failure output. See [D-008](docs/DECISION_LOG.md). `.env` is
+git-ignored; `.env.example` is not.
+
+MTProto proxy secrets are stored in plaintext (the tester needs the real value to
+connect) but wrapped in a `ProxySecret` type whose `str()`, `repr()` and f-string
+renderings are all masked, and which `json.dumps` refuses to serialise. The
+plaintext requires an explicit `.reveal()`. Two independent leak paths into
+database error text were found and closed — see
+[D-020](docs/DECISION_LOG.md), [D-027](docs/DECISION_LOG.md) and
+[docs/DATABASE.md](docs/DATABASE.md#secrets).
 
 ---
 

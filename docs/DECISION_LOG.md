@@ -365,16 +365,431 @@ about *measurement quality*, not infrastructure scale.
 
 ---
 
+### D-017 · Four tables, four responsibilities
+
+| Table | Role | Lifetime |
+|---|---|---|
+| `proxies` | **identity** — one row per distinct configuration | effectively permanent |
+| `proxy_discoveries` | **provenance** — where/when an identity was sighted | append-only |
+| `proxy_observations` | **measured behaviour** — one row per test attempt | append-only, the asset |
+| `proxy_scores` | **derived state** — versioned snapshots | append-only history |
+
+**Rationale.** These four have different write rates, different retention needs
+and different deletion semantics. Collapsing them — most temptingly, folding
+"current score" into `proxies` — would mean the scoring worker writes to the same
+row the tester leases, turning the coordination mechanism into a contention point
+and destroying score history in one move.
+
+**Consequences.** "Latest score" is a query (`DISTINCT ON (proxy_id) ... ORDER BY
+calculated_at DESC`), not a column. That query is indexed and cheap. Reporting
+must never treat `proxies` as a source of score truth.
+
+---
+
+### D-018 · No CHECK constraint on `protocol`
+
+`proxies.protocol` is `VARCHAR(16)` with a Python-side default of `"mtproto"` and
+no database-level allowlist.
+
+**Rationale.** The MVP is MTProto-only, but the brief asks for extensibility
+without building a multi-protocol platform. A closed CHECK list would make every
+future protocol a schema migration and a deploy-coordination problem. Correctness
+is already protected: `protocol` is an input to the fingerprint, so a wrong value
+yields a *different identity* rather than a collision or a silent merge.
+
+**Consequences.** A typo'd protocol string is storable. That is accepted — it
+cannot corrupt another proxy's history, and Task 003's parser validates the value
+before it reaches the database.
+
+---
+
+### D-019 · Fingerprint = versioned SHA-256 over protocol, server, port, secret bytes
+
+```
+sha256("v1" \x1f protocol \x1f normalized_server \x1f port \x1f secret_bytes.hex())
+```
+
+* `\x1f` (US) as the field separator, not `:` or `|`.
+* The secret is **decoded to bytes** (hex first, base64 fallback) and the full
+  byte string is hashed — no truncation.
+* The scheme version `v1` is part of the hashed payload.
+* `normalize_server`: strip, lowercase, remove IPv6 brackets, remove a trailing
+  root dot. No DNS resolution, no validation.
+
+**Rationale.** The UNIQUE index on `fingerprint` is what makes 10,000 sightings of
+one configuration collapse into one row, so the definition of "same proxy" is the
+load-bearing decision in the schema.
+
+Three specifics were verified rather than assumed:
+
+1. **A `:` separator really does collide.** `server="x:1", port=2, secret="y"` and
+   `server="x", port=1, secret="2:y"` both join to `x:1:2:y`. `\x1f` cannot
+   appear in a host, port or secret, so the split is unambiguous. Pinned by
+   `test_field_separator_prevents_concatenation_collisions`.
+2. **The secret must be in the hash.** Several distinct MTProto secrets routinely
+   share one `server:port`. Hashing the endpoint alone would merge different
+   proxies and lose candidates.
+3. **Full bytes, not Telethon's 16.** Telethon ≥1.35 `normalize_secret` truncates
+   to 16 bytes because it cannot use the fake-TLS SNI domain (see
+   `spike/AUDIT.md`). For *identity* the domain matters: `ee<key>google.com` and
+   `ee<key>telegram.org` are different proxies. Truncating would merge them.
+
+Including the version means a future scheme change is explicit: mixed schemes in
+one table would silently split or merge identities, which is unrecoverable.
+
+**Consequences.** `core/identity.py` has no SQLAlchemy and no I/O, so Task 003's
+parser, the ORM and the tests all share one definition. A golden digest is pinned
+in the tests; changing the scheme forces a conscious version bump.
+
+---
+
+### D-020 · Secrets stored in plaintext, protected by type and scrubbing
+
+The `proxies.secret` column stores the real value. There is no at-rest encryption.
+
+**Rationale.** The tester needs the plaintext to connect, so the value must be
+recoverable. Application-level encryption without a key-management strategy is
+theatre — it moves the secret into a key that then needs protecting, and the MVP
+has nowhere to put one. Inventing a half-solution would create a false sense of
+security, which is worse than an honest one.
+
+Protection is layered and each layer is tested:
+
+1. `ProxySecret` — a non-`str` wrapper. `str()`, `repr()`, `format()` (with *any*
+   format spec) and f-strings all yield a masked form. `json.dumps` raises rather
+   than emitting. Plaintext requires an explicit `.reveal()`, giving a reviewer
+   one thing to grep for.
+2. `SecretText` (a `TypeDecorator`) wraps every value read from the database, and
+   a `@validates` hook wraps every value *assigned* in Python. Without the second
+   half, a freshly constructed `Proxy` — the one most likely to be printed while
+   debugging — would hold a bare `str`.
+3. `core.logger.scrub_secrets` masks credentials in every log line and in every
+   value persisted to `proxy_observations.error_message_safe`.
+
+It is deliberately **not** a `str` subclass: a subclass would leak through
+`str.__format__` and through any `isinstance(x, str)` serialisation path.
+
+**Consequences.** Anyone who can read the database can read the secrets. That is
+accepted for the MVP and must be revisited before any multi-tenant or hosted
+deployment — see the follow-up table below.
+
+---
+
+### D-021 · `ON DELETE RESTRICT` for observations, `CASCADE` for discoveries and scores
+
+`proxy_observations.proxy_id` → `RESTRICT`. `proxy_discoveries` and `proxy_scores`
+→ `CASCADE`.
+
+**Rationale.** Measurement history is the asset this platform exists to build; it
+is also the only data that cannot be regenerated (a proxy that disappeared cannot
+be re-tested). Deleting it as a side effect of removing an identity row would be
+the worst failure mode available, so the database refuses. Scores and provenance
+are derivable or meaningless without the identity, so they cascade.
+
+**Consequences.** Retiring a proxy is `is_active = false`, not `DELETE`. Hard
+deletion requires removing observations first, which makes sanitisation an
+explicit, reviewable act. Retention pruning is a separate job, never a cascade.
+
+---
+
+### D-022 · `proxy_scores` is append-only history
+
+One row per scoring run, not one row per proxy. There is no UNIQUE constraint on
+`proxy_id`.
+
+**Rationale.** Scores are derived and recomputed. Storing history means a change
+to the scoring formula never destroys the ability to explain why a proxy ranked
+differently last week — which matters because the MVP's whole purpose is
+evaluating whether the scoring approach finds good candidates. `scoring_version`
+is mandatory for the same reason `tester_version` is on observations: without it
+a methodology change is indistinguishable from a behaviour change.
+
+**Consequences.** `ix_proxy_scores_proxy_id_calculated_at` serves "latest per
+proxy". The table grows; it is a snapshot table and can be pruned by age without
+losing the underlying observations.
+
+---
+
+### D-023 · `next_test_at` is `NOT NULL DEFAULT now()`
+
+**Rationale.** Two problems disappear at once:
+
+* A freshly discovered proxy is immediately due, with no special case in the
+  claim query.
+* A nullable column would force `ORDER BY next_test_at NULLS FIRST` to put
+  never-tested proxies at the front of the queue — and a plain ASC btree stores
+  NULLs *last*, so neither a forward nor a backward scan could serve that
+  ordering. An explicit `NULLS FIRST` index would be required.
+
+This was found the hard way: `postgresql_nulls_first` is **not** a valid `Index`
+dialect kwarg in SQLAlchemy 2.x, so the obvious way to express it does not exist.
+Making the column NOT NULL removes the need entirely rather than fighting the ORM.
+
+**Consequences.** "Never tested" and "due now" are the same state. That is the
+desired semantics for a discovery-driven queue.
+
+---
+
+### D-024 · Claiming: CTE + `FOR UPDATE SKIP LOCKED` + `UPDATE … RETURNING`, lease-based
+
+One statement, one round trip:
+
+```sql
+WITH claim_candidates AS (
+  SELECT id FROM proxies
+  WHERE is_active AND next_test_at <= :now
+    AND (test_lock_until IS NULL OR test_lock_until < :now)
+  ORDER BY next_test_at, id LIMIT :limit
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE proxies SET test_lock_until = :lease, last_test_started_at = :now,
+                   test_attempts = test_attempts + 1
+FROM claim_candidates WHERE proxies.id = claim_candidates.id
+RETURNING *;
+```
+
+Three rules follow from it:
+
+1. **`SKIP LOCKED`, never plain `FOR UPDATE`.** With plain `FOR UPDATE` a second
+   worker *blocks* until the first commits. If the first is sitting in an
+   8-second MTProto handshake, the second is idle for 8 seconds. `SKIP LOCKED`
+   makes it take different rows, so N workers partition the work.
+2. **Never hold a transaction open across network I/O.** Claim in one
+   transaction, commit, test, then write results in a second transaction. The
+   claim query returns everything the tester needs (`RETURNING *`), so no
+   follow-up read is required.
+3. **The lease (`test_lock_until`) is what makes a crash self-healing.** A worker
+   killed with `kill -9` never clears its claim; the lease expires and the row
+   becomes claimable again. Without it, one crash would strand proxies
+   permanently.
+
+`test_attempts` is incremented **server-side** (`SET x = x + 1`), not read-modify-
+written in Python, so concurrent claims cannot lose an update. The counter is the
+trail left by a proxy that repeatedly kills workers.
+
+The `ORDER BY … , id` tiebreak makes the ordering total, so two workers cannot
+both see the same "first" row when timestamps are equal.
+
+**Two guarantees, not one — and the second had to be moved into Python.**
+`UPDATE … FROM claim_candidates … RETURNING` does **not** preserve the CTE's
+`ORDER BY`. PostgreSQL joins the CTE to the target table and returns rows in join
+order, which tracks heap layout. Verified against PostgreSQL 16.2: with six due
+rows inserted in scrambled order and `limit=3`, the three *oldest* were correctly
+leased, but came back as `p1, p0, p2`.
+
+So:
+
+* **Selection fairness is enforced by the database** and was never at risk — the
+  CTE's `ORDER BY next_test_at, id LIMIT n` decides *which* rows get leased, so no
+  proxy can be starved by a stream of new arrivals.
+* **The returned list order is enforced in Python** (`claimed.sort(...)`), because
+  relying on the SQL would make it depend on what else happens to be in the table.
+
+This was found by a test that had previously passed *by luck*: the assertion on
+output order held only while heap layout happened to coincide with due order. A
+fresh cluster exposed it. It matters because a tester working the batch in order
+should reach the most-overdue proxies first — if it is killed mid-batch, the
+most-starved rows were already done. Cost is negligible: at most `limit` rows.
+
+**Consequences.** PostgreSQL is the only coordination mechanism — no Redis, no
+Celery, matching D-016. Verified with four concurrent engines (separate pools,
+standing in for separate processes) claiming 40 rows: every row claimed exactly
+once, no blocking, no deadlock.
+
+One hazard was found and is now documented in the tests: a **rollback expires
+every ORM attribute**, and re-reading one fires a lazy refresh that cannot run
+under asyncio. `expire_on_commit=False` protects the commit path only. Workers
+must read `id`/`server`/`port`/`secret` out of a claimed proxy immediately.
+
+---
+
+### D-025 · Partial index `(observed_at) WHERE success`, not composite `(success, observed_at)`
+
+The Task 002 outline suggested a composite on `(success, observed_at)`. Shipped
+instead: `ix_proxy_observations_success_observed_at` on `(observed_at)` with a
+`WHERE success` predicate.
+
+**Rationale.** Latency aggregation only ever reads successes, and the filter value
+is a constant. A boolean leading column roughly doubles the index size while
+serving exactly the same query. The partial form is smaller and equally usable.
+
+**Consequences.** A query filtering on `success = false` cannot use it — correct,
+since failure analysis aggregates over `proxy_id`+`observed_at`, which the
+composite `ix_proxy_observations_proxy_id_observed_at` serves. Verified with
+`EXPLAIN` under `enable_seqscan=off`: the claim query does use `ix_proxies_due`,
+and a query that drops `is_active` correctly *cannot*, which is the discriminating
+proof that the index really is partial.
+
+---
+
+### D-026 · `error_category` is `VARCHAR(32)` + a Python `StrEnum`, not a PostgreSQL enum
+
+**Rationale.** The failure taxonomy will evolve as Task 005 meets real Telethon
+behaviour. A native enum makes every new category a migration (`ALTER TYPE … ADD
+VALUE`, which cannot run inside a transaction block before PG 12 and is awkward
+after). A `StrEnum` in Python gives the same ergonomics — tab completion,
+exhaustive matching — with no schema coupling.
+
+`WRONG_SECRET` is deliberately **absent**. MTProxy drops bad-secret payloads
+without RST or error, so a wrong secret is indistinguishable from a blackholed
+endpoint; claiming to detect it would fabricate a diagnosis. Those cases surface
+as `MT_PROTO_TIMEOUT` (see `spike/AUDIT.md` §3).
+
+The outline's names map as follows so Task 005 does not reinvent them:
+`TCP_UNREACHABLE`→`TCP_ERROR`, `MTPROXY_TIMEOUT`→`MT_PROTO_TIMEOUT`,
+`MTPROXY_PROTOCOL_ERROR`→`PROTOCOL_ERROR`,
+`TELEGRAM_CONNECTION_ERROR`→`TELEGRAM_RPC_ERROR`, `INVALID_PROXY`→
+`PROTOCOL_ERROR`, `UNKNOWN`→`UNKNOWN_ERROR`.
+
+**Consequences.** The database will accept an unlisted category string. That is
+the point — a new category is a code change, not a deploy-coordinated migration.
+
+---
+
+### D-027 · Two defences against secrets in database error text
+
+Discovered empirically, not assumed. When a CHECK constraint rejects a row,
+PostgreSQL appends `DETAIL: Failing row contains (...)` and echoes **every
+column** — including the plaintext secret. That text reaches
+`safe_error_message`, which would have persisted it to
+`proxy_observations.error_message_safe` and logged it.
+
+Two independent leak paths, two independent fixes:
+
+1. **`hide_parameters=True`** on the engine. SQLAlchemy appends
+   `[parameters: (...)]` to DBAPI errors. Off by default in this project;
+   toggleable via `DB_HIDE_PARAMETERS` for local debugging.
+2. **A shape-based scrubber** in `core.logger`: any bare run of ≥32 hex
+   characters is masked. Key-based patterns (`secret=…`) cannot reach a value
+   that arrives with no key in front of it. This is the *only* thing that covers
+   PostgreSQL's own `DETAIL` output — `hide_parameters` does not.
+
+**Cost, accepted deliberately:** 64-character fingerprints are masked in error
+text too. A fingerprint is derivable from the row and rarely belongs in an error
+message; a secret in a log aggregator is not recoverable. Shorter hex runs
+(ports, ids, latencies) are untouched, so ordinary debugging output survives.
+
+**Consequences.** `safe_error_message` output is safe to persist by construction.
+The raw SQLAlchemy exception still contains the secret — so it must never be
+logged or stored directly, only through the helper.
+
+---
+
+### D-028 · No module-level engine singleton
+
+Each process builds its own `Database` and disposes it at shutdown.
+
+**Rationale.** A global would be per-process anyway, but keeping it explicit
+removes any temptation to share state across processes and — the concrete bug —
+avoids binding a connection pool to an event loop that a later `asyncio.run()`
+has already replaced.
+
+**Consequences.** Worker entrypoints own `Database` lifetime. Integration tests
+build one engine per test, which is why the fixture is function-scoped.
+
+---
+
+### D-029 · `TEST_DATABASE_URL` is derived, and refused in production
+
+When unset, `resolved_test_url` appends `_test` to the database component of
+`DATABASE_URL`. Under `ENV=production` with no explicit value, it **raises**.
+
+**Rationale.** The migration lifecycle test runs `downgrade base`, which DROPS
+EVERY TABLE. Derivation means a contributor never points the destructive suite at
+their development data by accident; the production refusal means a production
+database can never become a test target by inference.
+
+Derivation uses `urllib.parse`, not string surgery, because asyncpg carries the
+Unix-socket directory in `?host=` and that must survive untouched — losing it
+would make the suite dial a TCP port with no server on it. Idempotent: an
+already-`_test` database is not doubled.
+
+**Consequences.** Production integration testing requires an explicit
+`TEST_DATABASE_URL`. That friction is intentional.
+
+---
+
+### D-030 · Local PostgreSQL via `pgserver`, not Docker
+
+`scripts/dev_pg.py` provisions a real PostgreSQL 16.2 from a self-contained wheel:
+
+```
+uv run --with pgserver python scripts/dev_pg.py up
+uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest -m integration
+uv run --with pgserver python scripts/dev_pg.py down
+```
+
+**Rationale.** Task 002 requires the integration suite to genuinely run, and
+Docker must not become a local-development requirement. `pgserver` is fetched ad
+hoc — exactly like the spike's `uv run --with telethon` — so it is **not** a
+project dependency and does not appear in `uv.lock`.
+
+It provisions a **non-superuser** role (`mtproto`, with `CREATEDB`) so migrations
+and tests exercise real privileges instead of silently relying on superuser rights
+production will not grant. The cluster lives in `$XDG_CACHE_HOME`, outside the
+repository: a PostgreSQL data directory is thousands of small files and does not
+belong in a working tree.
+
+Any other PostgreSQL works — point `DATABASE_URL` at Supabase/Neon/RDS/a system
+package and never run this script.
+
+**Consequences.** No Docker dependency. `pyproject.toml` and `uv.lock` are
+unchanged. The integration suite still skips cleanly when no server is present.
+
+---
+
+### D-031 · Integration tests truncate; migration tests get their own database
+
+* Tables are `TRUNCATE … RESTART IDENTITY CASCADE`d before each test rather than
+  rolled back in a savepoint.
+* The migration lifecycle module creates and drops a dedicated
+  `<testdb>_lifecycle` database.
+
+**Rationale.** A savepoint rollback cannot exercise `FOR UPDATE SKIP LOCKED`
+across concurrent sessions, which is the single most important behaviour in this
+layer — the whole point is what *other* transactions see. And `downgrade base`
+drops every table, so it must never share a database with anything else.
+
+Fixtures run the real Alembic CLI rather than `Base.metadata.create_all`: the
+point is that the *migration* produces a working schema. `create_all` would let
+the migration rot while every test still passed. `alembic check` is asserted
+empty after upgrade, which is what catches a model change never turned into a
+migration.
+
+**Consequences.** A `pytest_runtest_makereport` hook scrubs credentials out of
+failure output, because pytest prints fixture values verbatim and these fixtures
+hold DSNs — and a failure report is exactly what gets pasted into an issue.
+
+---
+
+### D-032 · `Float` for latencies, `Numeric` for scores
+
+`proxy_observations.*_ms` → `DOUBLE PRECISION`. `proxy_scores.score` /
+`reliability_*` / `latency_p*` → `NUMERIC`.
+
+**Rationale.** Observations are sensor readings at millions of rows, where storage
+and comparison speed matter more than exact decimal semantics — but sub-millisecond
+precision is real (a LAN handshake can be 0.4 ms), so an integer column would be
+lossy. Scores are ranked and compared, where exact decimal semantics keep ordering
+deterministic and float accumulation would not.
+
+**Consequences.** `NUMERIC(6,3)` caps `score` at 999.999, so a value of 1000
+overflows the *type* as a `DBAPIError` before the `score <= 100` CHECK can fire.
+Two independent guards, different exceptions — both pinned in tests so nobody
+"fixes" one and assumes the other covers it.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |
 |---|---|
-| PostgreSQL models, indexes, Alembic migrations, fingerprint uniqueness | 002 |
+| ~~PostgreSQL models, indexes, Alembic migrations, fingerprint uniqueness~~ | **002 — delivered** |
 | `MTProtoProxy` domain type, link parsing, deterministic fingerprinting | 003 |
 | `SourceFetcher` abstraction, source health metadata | 004, 018 |
 | Telethon transport wrapper, three-phase test, error taxonomy, resource safety | 005 |
-| Batch claiming with `FOR UPDATE SKIP LOCKED`, bounded concurrency | 006, 014 |
-| Observation storage | 007 |
+| Claim primitive with `FOR UPDATE SKIP LOCKED` shipped in 002 (D-024); bounded concurrency and worker wiring remain | 006, 014 |
+| Observation *schema* shipped in 002; write path and retention remain | 007 |
 | Scoring formula and confidence adjustment | 008, 009 |
 | Reporting, Telegram publishing | 010, 011 |
 | `ContentProvider` abstraction, Qwen, deterministic fallback template | 012, 024 |

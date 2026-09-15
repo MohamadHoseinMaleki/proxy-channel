@@ -241,3 +241,143 @@ class TestSecretHygiene:
     def test_safe_dump_never_contains_the_plain_dsn(self) -> None:
         dumped = make_settings(database_url=SecretStr(self.DSN)).safe_dump()
         assert self.DSN not in str(dumped)
+
+
+class TestResolvedTestUrl:
+    """Which database the integration suite is allowed to touch.
+
+    The migration lifecycle test runs ``downgrade base``, which DROPS EVERY
+    TABLE. Deriving the wrong DSN here is destructive, so the resolution rules
+    are pinned.
+    """
+
+    DEV = "postgresql+asyncpg://mtproto:pw@localhost:5432/mtproto"
+
+    def test_derives_a_test_suffix_from_the_dev_dsn(self) -> None:
+        assert make_settings(database_url=self.DEV).resolved_test_url == (
+            "postgresql+asyncpg://mtproto:pw@localhost:5432/mtproto_test"
+        )
+
+    def test_never_targets_the_dev_database(self) -> None:
+        settings = make_settings(database_url=self.DEV)
+        assert settings.resolved_test_url != settings.sqlalchemy_url
+
+    def test_explicit_test_dsn_wins(self) -> None:
+        explicit = "postgresql+asyncpg://u:p@localhost/explicit_db"
+        settings = make_settings(database_url=self.DEV, test_database_url=explicit)
+        assert settings.resolved_test_url == explicit
+
+    def test_explicit_test_dsn_wins_even_when_it_looks_like_the_dev_one(self) -> None:
+        settings = make_settings(database_url=self.DEV, test_database_url=self.DEV)
+        assert settings.resolved_test_url == self.DEV
+
+    def test_explicit_test_dsn_is_normalised_to_asyncpg(self) -> None:
+        settings = make_settings(
+            database_url=self.DEV, test_database_url="postgresql://u:p@localhost/t"
+        )
+        assert settings.resolved_test_url.startswith("postgresql+asyncpg://")
+
+    def test_derivation_normalises_a_bare_postgres_prefix(self) -> None:
+        settings = make_settings(database_url="postgresql://u:p@localhost:5432/mtproto")
+        assert settings.resolved_test_url == (
+            "postgresql+asyncpg://u:p@localhost:5432/mtproto_test"
+        )
+
+    def test_query_parameters_survive_derivation(self) -> None:
+        # asyncpg carries the Unix-socket directory in ?host=; losing it would
+        # make the test suite dial a TCP port that has no server on it.
+        url = "postgresql+asyncpg://mtproto:pw@/mtproto?host=/var/run/postgresql"
+        derived = make_settings(database_url=url).resolved_test_url
+        assert derived == "postgresql+asyncpg://mtproto:pw@/mtproto_test?host=/var/run/postgresql"
+
+    def test_multiple_query_parameters_survive(self) -> None:
+        url = "postgresql+asyncpg://u:p@h/d?ssl=require&application_name=tester"
+        derived = make_settings(database_url=url).resolved_test_url
+        assert derived.endswith("/d_test?ssl=require&application_name=tester")
+
+    def test_an_already_suffixed_database_is_not_doubled(self) -> None:
+        # Keeps `resolved_test_url` idempotent, so pointing DATABASE_URL at the
+        # test database does not produce `mtproto_test_test`.
+        url = "postgresql+asyncpg://u:p@localhost/mtproto_test"
+        assert make_settings(database_url=url).resolved_test_url == url
+
+    def test_refuses_to_derive_in_production(self) -> None:
+        # A production database must never become a test target by inference.
+        settings = make_settings(env="production", database_url=self.DEV)
+        with pytest.raises(ValueError, match="ENV=production"):
+            _ = settings.resolved_test_url
+
+    def test_production_with_an_explicit_test_dsn_is_allowed(self) -> None:
+        settings = make_settings(
+            env="production", database_url=self.DEV, test_database_url=self.DEV + "_shadow"
+        )
+        assert settings.resolved_test_url == self.DEV + "_shadow"
+
+    @pytest.mark.parametrize("env", ["development", "staging"])
+    def test_derives_outside_production(self, env: str) -> None:
+        assert make_settings(env=env, database_url=self.DEV).resolved_test_url.endswith(
+            "mtproto_test"
+        )
+
+    def test_refuses_a_dsn_with_an_empty_database_path(self) -> None:
+        with pytest.raises(ValueError, match="empty path"):
+            _ = make_settings(database_url="postgresql+asyncpg://u:p@localhost").resolved_test_url
+
+    def test_env_var_is_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TEST_DATABASE_URL", "postgresql+asyncpg://u:p@localhost/from_env")
+        assert build_settings(env_file=None).resolved_test_url.endswith("/from_env")
+
+    def test_test_database_url_is_a_secret_str(self) -> None:
+        settings = make_settings(database_url=self.DEV, test_database_url=self.DEV)
+        assert isinstance(settings.test_database_url, SecretStr)
+
+    def test_test_database_url_is_masked_in_the_repr(self) -> None:
+        # A distinctive password, so the assertion cannot pass by accident
+        # through a short substring appearing elsewhere in the repr.
+        distinctive = "un1que-test-db-passw0rd"
+        settings = make_settings(
+            database_url=self.DEV,
+            test_database_url=f"postgresql+asyncpg://u:{distinctive}@localhost/t",
+        )
+        rendered = repr(settings)
+        assert distinctive not in rendered
+        assert str(settings).find(distinctive) == -1
+        assert "**********" in rendered
+
+    def test_safe_dump_masks_the_test_dsn(self) -> None:
+        dumped = make_settings(database_url=self.DEV, test_database_url=self.DEV).safe_dump()
+        assert dumped["test_database_url"] == "**********"
+
+
+class TestPoolPrePing:
+    def test_defaults_to_true(self) -> None:
+        # A stale pooled connection otherwise surfaces as an InterfaceError deep
+        # inside a worker loop; pre-ping turns it into a transparent reconnect.
+        assert make_settings().db_pool_pre_ping is True
+
+    def test_can_be_disabled(self) -> None:
+        assert make_settings(db_pool_pre_ping=False).db_pool_pre_ping is False
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DB_POOL_PRE_PING", "false")
+        assert build_settings(env_file=None).db_pool_pre_ping is False
+
+    def test_rejects_a_non_boolean(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            make_settings(db_pool_pre_ping="maybe")
+
+
+class TestHideParameters:
+    def test_defaults_to_true(self) -> None:
+        # SQLAlchemy appends [parameters: (...)] to DBAPI errors and this schema
+        # stores an MTProto secret in plaintext, so hiding them is the safe default.
+        assert make_settings().db_hide_parameters is True
+
+    def test_can_be_disabled_for_debugging(self) -> None:
+        assert make_settings(db_hide_parameters=False).db_hide_parameters is False
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DB_HIDE_PARAMETERS", "false")
+        assert build_settings(env_file=None).db_hide_parameters is False
