@@ -10,7 +10,7 @@ behaviour against a real server is covered in ``tests/integration``.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -137,9 +137,7 @@ class TestValidation:
             await claim(now=datetime(2026, 9, 15, 12, 0, 0))
 
     async def test_accepts_a_non_utc_timezone(self) -> None:
-        from zoneinfo import ZoneInfo
-
-        tehran = PINNED.astimezone(ZoneInfo("Asia/Tehran"))
+        tehran = PINNED.astimezone(timezone(timedelta(hours=3, minutes=30), name="Asia/Tehran"))
         assert tehran.tzinfo is not None
         session = await claim(now=tehran)
         # Same instant, so the same lease boundary.

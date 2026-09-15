@@ -782,7 +782,7 @@ Two independent guards, different exceptions — both pinned in tests so nobody
 
 ### D-033 · Cross-platform failures are reproduced on Linux, not skipped
 
-Three cross-platform issues were found only because the suite was run on Windows.
+Four cross-platform issues were found only because the suite was run on Windows.
 None was a Windows bug in the strict sense — each was a *narrow assumption* that
 happened to hold on the only platform being tested.
 
@@ -821,6 +821,17 @@ integration through the event loop; on Windows they now skip cleanly with an
 explanatory message, while `test_fallback_handler_used_when_loop_cannot`
 continues to verify the Windows fallback signal mechanism.
 
+**(d) IANA timezone database unavailable on Windows without tzdata.** On Linux,
+Python's standard library `zoneinfo` reads timezone files from `/usr/share/zoneinfo`.
+On Windows, no such directory exists; `zoneinfo` falls back to the optional `tzdata`
+PyPI package. When `tzdata` is not installed, `ZoneInfo("Asia/Tehran")` raises
+`ZoneInfoNotFoundError`. The unit test `test_accepts_a_non_utc_timezone` in
+`tests/test_scheduling.py` needed a timezone-aware datetime with a non-UTC offset
+to verify that `claim_due_proxies` handles non-UTC datetimes; it now uses
+`timezone(timedelta(hours=3, minutes=30), name="Asia/Tehran")` from `datetime`,
+which is built-in, requires zero external packages or OS files, and behaves
+identically on every platform.
+
 **Rationale.** A guard that only fails on an untested platform is worse than no
 guard, because CI keeps reporting green. So each failure was converted into a
 test that reproduces the platform *here*:
@@ -830,6 +841,7 @@ test that reproduces the platform *here*:
 | 15.6 ms monotonic quanta | `monkeypatch`ing `time.monotonic` to `int(t / 0.015625) * 0.015625` |
 | Driver rejecting a Unix-socket DSN | `monkeypatch`ing `AsyncEngine.connect` to raise `NotImplementedError` |
 | Windows `os.kill` terminating process | `monkeypatch`ing `sys.platform` to `win32` and asserting clean skips |
+| Windows without `tzdata` package | `datetime.timezone` with explicit offset and name |
 
 All are exact stand-ins for the real thing, so `test_survives_a_coarse_monotonic_clock`,
 `test_is_reachable_survives_a_failure_type_nobody_enumerated`,
