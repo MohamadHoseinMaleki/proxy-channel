@@ -117,6 +117,35 @@ class TestSecretIdentityBytes:
         # Determinism beats strictness here: Task 003 decides acceptability.
         assert secret_identity_bytes("!!!not-hex-or-base64!!!") == b"!!!not-hex-or-base64!!!"
 
+    def test_case_folding_applies_to_hex_but_not_to_opaque_fallbacks(self) -> None:
+        """Pins a deliberate asymmetry that looks like a bug from the outside.
+
+        A well-formed secret is decoded to bytes, so ``EE…`` and ``ee…`` are one
+        identity -- verified for both hex and the protocol/server dimensions. A
+        malformed one (odd-length hex like ``EE000``, which no MTProto secret
+        ever is) cannot be decoded, so it stays opaque and *keeps* its case.
+
+        That is not an oversight. The opaque branch is where base64 secrets land
+        when they are not hex-decodable, and base64 is case-sensitive: folding
+        case there would merge two genuinely different proxies into one row and
+        silently lose one of them forever. The asymmetric cost is intentional --
+        a duplicate row wastes one test, a false merge loses a proxy.
+
+        A parallel implementation asserted ``EE000 == ee000``; this test records
+        why that assertion was not adopted, so the difference is not "fixed" by
+        someone who only sees one half of the reasoning.
+        """
+        # Well-formed: case-insensitive, because both decode to the same bytes.
+        assert secret_identity_bytes("EE" + "A1" * 15) == secret_identity_bytes("ee" + "a1" * 15)
+        assert secret_identity_bytes("EE00") == secret_identity_bytes("ee00")
+        assert fp(secret="EE" + "A1" * 15) == fp(secret="ee" + "a1" * 15)
+
+        # Malformed (odd length, not valid hex or base64): opaque, so case stays.
+        assert secret_identity_bytes("EE000") != secret_identity_bytes("ee000")
+
+        # Whitespace is stripped in both branches -- that part is unconditional.
+        assert secret_identity_bytes("  EE000  ") == secret_identity_bytes("EE000")
+
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValueError, match="must not be empty"):
             secret_identity_bytes("   ")

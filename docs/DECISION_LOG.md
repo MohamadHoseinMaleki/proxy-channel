@@ -822,7 +822,7 @@ Both are exact stand-ins for the real thing, so `test_survives_a_coarse_monotoni
 `test_is_reachable_survives_a_failure_type_nobody_enumerated` and
 `test_returns_false_when_the_driver_rejects_the_dsn_for_platform_reasons` now run
 in every CI job rather than only on the machine that discovered them. Running the
-whole unit suite under the quantised clock yields **498 passed** — the same as
+whole unit suite under the quantised clock yields **499 passed** — the same as
 without it, which is the point.
 
 **Consequences.** `ping()`'s docstring now states the failure-type list is
@@ -833,13 +833,85 @@ socket path, and nothing in this decision claims otherwise.
 
 ---
 
+### D-034 · What was taken from the parallel `wip/mtproto-platform-local` draft
+
+A second, independent draft of the same project existed uncommitted on a
+developer machine (`4239c5c`, 25 files, ~700 lines) under a `mtproto-platform/`
+subdirectory. It was reviewed file by file rather than merged wholesale or
+dismissed. Three things came out of it.
+
+**Taken.**
+
+*`infra/docker/docker-compose.yml`* — an optional containerised PostgreSQL.
+Adopted with two corrections: the draft hardcoded `POSTGRES_PASSWORD: password`
+and committed it, which puts a live credential in version control and in every
+`docker inspect`, so credentials are now interpolated and the password is
+*required* (`${POSTGRES_PASSWORD:?…}`); and the port is bound to `127.0.0.1`
+only. The obsolete `version:` key was dropped. This does not reverse D-030 —
+`dev_pg.py` is still the primary path and Docker is still not required by
+anything.
+
+*The normalisation intent behind `tests/test_fingerprint.py`* — the draft
+asserted that `" MTproto"`, `" 1.2.3.4  "`, `"EE000 "` and their clean
+lower-case equivalents are one identity. Checked dimension by dimension against
+`compute_fingerprint`: protocol case, server whitespace, secret whitespace and
+secret case all already agree. The one divergence is the draft's own fixture —
+`"EE000"` is odd-length and therefore not valid hex, so it lands in the opaque
+fallback where case is *preserved*. That is deliberate and is now pinned by
+`test_case_folding_applies_to_hex_but_not_to_opaque_fallbacks`, because the
+opaque branch is where non-hex base64 secrets land and base64 is case-sensitive:
+folding there would merge two different proxies into one row and lose one
+forever. A duplicate row wastes a test; a false merge loses a proxy.
+
+**Logged for Task 004, not taken now.**
+
+*`ProxySource` as a first-class table* — the draft normalises sources into their
+own table with `last_scraped_at`, where this schema carries provenance inline on
+`proxy_discoveries` (`source_type`, `source_name`, `source_url`). Their shape is
+the better fit for the source-health metadata Task 004/018 needs, and for
+deduplicating source URLs. It is a schema change, though, and Task 002 is
+migrated and green; retrofitting it now would churn a committed schema for a
+requirement that has not been designed yet. Added to the deferred table.
+
+**Rejected, with reasons.**
+
+| Draft | Why not |
+|---|---|
+| `echo=(settings.env == "dev")` | SQLAlchemy `echo` logs statements **with bound parameters**. In dev this writes every MTProto secret and the DB password to stdout. The single most serious issue in the draft. |
+| Module-level `engine` / `settings` at import time | Importing `core.database` then requires a valid `DATABASE_URL` and builds a pool nobody asked for. D-028 rejected this already. |
+| No lease columns on `Proxy` | No `locked_by` / `locked_until` / `next_test_at` / `is_active`, so `FOR UPDATE SKIP LOCKED` claiming is impossible and three processes would grab the same proxy. That is the coordination mechanism the brief mandates. |
+| `secret: Mapped[str] = mapped_column(String)` | Unbounded and unmasked; no `ProxySecret`. Combined with `echo=True` there is nothing between a secret and a log file. |
+| `ProxyScore` one-to-one, `proxy_id` as PK | Overwrites each snapshot. "Did the score improve?" and scoring regressions become unanswerable; D-022 chose append-only history. |
+| `cascade="all, delete-orphan"` on observations | Deleting a proxy silently destroys its measurement history. D-021 chose RESTRICT. |
+| `Index(..., "is_success")` | A btree over a two-valued column is near-useless. D-025 chose a partial index `WHERE success`. |
+| `except NotImplementedError: pass` around `add_signal_handler` | On Windows this installs **no** handler at all, so Ctrl+C hard-kills the worker instead of shutting it down. Ours falls back to `signal.signal()`. Same fragility class as D-033. |
+| `logger.py` with no scrubbing | No equivalent of `scrub_secrets()`; D-027's two defences would not exist. |
+| `database_url` default with `postgres:password@localhost` | A credential-shaped default baked into source. |
+| `Base` with no naming convention | Unnamed constraints cannot be reliably dropped or altered by later Alembic revisions. |
+| `tests/test_fingerprint.py` importing `src.modules.fingerprint` | That module does not exist in the draft, so its suite errors during collection. |
+| `main.py` = `print("Hello from mtproto-platform!")` | The untouched `uv init` stub. |
+
+**Rationale.** The draft has the right module *names* and one genuinely better
+schema idea, but it is early-stage: no identity implementation behind its
+fingerprint test, no scheduling columns, no secret handling, and an `echo=True`
+that would leak secrets in the exact environment developers stare at. Merging
+code would have been a regression; merging the two ideas and the one
+counter-example was not.
+
+**Consequences.** Reviewing it produced a test this project would not otherwise
+have had — the hex/opaque case-folding asymmetry was correct but undocumented,
+and would have looked like a bug to the next reader. `ProxySource` is now on the
+deferred table for Task 004 instead of being rediscovered there.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |
 |---|---|
 | ~~PostgreSQL models, indexes, Alembic migrations, fingerprint uniqueness~~ | **002 — delivered** |
 | `MTProtoProxy` domain type, link parsing, deterministic fingerprinting | 003 |
-| `SourceFetcher` abstraction, source health metadata | 004, 018 |
+| `SourceFetcher` abstraction, source health metadata — and with it the D-034 question of whether `ProxySource` becomes a first-class table instead of inline provenance on `proxy_discoveries` | 004, 018 |
 | Telethon transport wrapper, three-phase test, error taxonomy, resource safety | 005 |
 | Claim primitive with `FOR UPDATE SKIP LOCKED` shipped in 002 (D-024); bounded concurrency and worker wiring remain | 006, 014 |
 | Observation *schema* shipped in 002; write path and retention remain | 007 |

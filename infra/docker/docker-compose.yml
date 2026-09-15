@@ -1,0 +1,46 @@
+# Optional PostgreSQL for people who already run Docker.
+#
+# This is NOT the primary path and nothing in the project requires Docker.
+# `scripts/dev_pg.py` (see DECISION_LOG D-030) provisions a throwaway cluster
+# with no daemon to install, and is what the test suite and docs assume. Use
+# this file only if you prefer a container you manage yourself.
+#
+#   docker compose -f infra/docker/docker-compose.yml up -d
+#   export DATABASE_URL="postgresql+asyncpg://mtproto:$(cat .pgpass)@127.0.0.1:5432/mtproto"
+#   uv run alembic upgrade head
+#
+# Credentials come from the environment or a `.env` file next to this compose
+# file -- never from this file. The upstream draft of this service hardcoded
+# `POSTGRES_PASSWORD: password` and committed it; that puts a live credential in
+# version control and in every `docker inspect`, so it is interpolated instead.
+# The defaults below are deliberately obvious placeholders for a loopback-only
+# development database, not secrets anyone should reuse.
+
+name: mtproto-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mtproto_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mtproto}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or infra/docker/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-mtproto}
+    ports:
+      # Bound to loopback only. Publishing PostgreSQL on 0.0.0.0 with a
+      # development password is how test databases end up mined for crypto.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mtproto} -d ${POSTGRES_DB:-mtproto}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # PostgreSQL needs a little room; the 64 MB default can OOM under the
+    # integration suite's truncate-heavy workload.
+    shm_size: 256mb
+
+volumes:
+  postgres_data:
