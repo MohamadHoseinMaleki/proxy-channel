@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     worker_error_backoff_seconds: float = Field(default=2.0, ge=0)
     worker_max_error_backoff_seconds: float = Field(default=60.0, ge=0)
 
+    # --- Telegram & Tester (Task 004) --------------------------------------
+    telegram_api_id: int | None = Field(default=None)
+    telegram_api_hash: SecretStr | None = Field(default=None)
+    tester_concurrency: int = Field(default=10, ge=1, le=100)
+    tester_tcp_timeout_seconds: float = Field(default=3.0, gt=0)
+    tester_mtproto_timeout_seconds: float = Field(default=8.0, gt=0)
+    tester_total_timeout_seconds: float = Field(default=15.0, gt=0)
+    tester_batch_size: int = Field(default=25, ge=1, le=200)
+
     # --- Validation --------------------------------------------------------
 
     @field_validator("log_level", "third_party_log_level", mode="before")

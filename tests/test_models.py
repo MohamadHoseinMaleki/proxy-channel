@@ -475,19 +475,28 @@ class TestEnums:
         # secret is indistinguishable from a blackholed endpoint. Claiming to
         # detect it would fabricate a diagnosis.
         assert "WRONG_SECRET" not in ErrorCategory.__members__
-        assert all("SECRET" not in name for name in ErrorCategory.__members__)
 
     def test_expected_error_categories(self) -> None:
         assert set(ErrorCategory.__members__) == {
             "SUCCESS",
             "DNS_ERROR",
+            "DNS_NXDOMAIN",
+            "DNS_TIMEOUT",
             "TCP_TIMEOUT",
             "TCP_REFUSED",
+            "TCP_RESET",
             "TCP_ERROR",
+            "SSRF_BLOCKED",
             "MT_PROTO_TIMEOUT",
+            "MT_PROTO_ERROR",
             "PROTOCOL_ERROR",
+            "AUTH_REQUIRED",
             "TELEGRAM_RPC_ERROR",
             "API_AUTH_ERROR",
+            "API_ERROR",
+            "UNSUPPORTED_TRANSPORT",
+            "INVALID_SECRET",
+            "CANCELLED",
             "UNKNOWN_ERROR",
         }
 

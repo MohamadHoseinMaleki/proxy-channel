@@ -965,6 +965,40 @@ Task 003 implements the discovery layer (`src/modules/discovery`). Key decisions
 
 ---
 
+### D-036 · MTProto tester architecture, Telethon audit findings, and Fake-TLS limitations
+
+Task 004 implements the real MTProto connectivity tester (`src/modules/tester` and `src/workers/tester.py`). Key decisions and verified audit findings:
+
+1. **Telethon Transport Architecture & Audit:**
+   * Telethon is pinned at `>=1.35.0` (probed and verified against 1.45.0).
+   * Transport classes audited: `ConnectionTcpMTProxyRandomizedIntermediate` (mandatory for `0xdd` secure randomized secrets, and optimal for 16-byte legacy secrets), `ConnectionTcpMTProxyIntermediate` (4-byte length), and `ConnectionTcpMTProxyAbridged` (1-byte length).
+   * `select_transport()` maps `SECURE_RANDOMIZED` (`0xdd`) and `LEGACY` to `ConnectionTcpMTProxyRandomizedIntermediate` for maximum obfuscation and firewall resistance.
+
+2. **Fake-TLS (0xee) Findings & Honest Limitation:**
+   * Telethon's `TcpMTProxy.normalize_secret` truncates `0xee` secrets to 16 bytes and explicitly discards the SNI domain (`"until domain support is added"`).
+   * Telethon does **not** implement wire-level TLS emulation (no TLS `ClientHello` is emitted, no SNI is sent). MTProxy servers enforcing real Fake-TLS handshakes drop these connections.
+   * Rather than faking support or generating false failure diagnoses, `select_transport()` classifies Fake-TLS secrets as unsupported (`UNSUPPORTED_TRANSPORT`) with an honest, documented diagnostic message explaining Telethon's lack of wire-level TLS emulation.
+
+3. **Latency Floor Discovery in Telethon:**
+   * Audited `TcpMTProxy._connect()`: contains an unconditional 2-second latency wait (`self._wait_for_data('proxy')`) as a workaround for upstream issue #1134 (server dropping rapid payloads).
+   * Consequently, all Telethon-measured MTProto connects have a structural ~2000 ms floor. We measure raw TCP handshake latency separately in Phase 2 (`tcp_connect_ms`), providing accurate physical network latency alongside the MTProto session latency (`mtproto_connect_ms`).
+
+4. **Ephemeral Session Handling:**
+   * Ephemeral test client strictly uses `telethon.sessions.MemorySession()`.
+   * Never passes a filename string or session name, ensuring zero SQLite `.session` files are created on disk.
+   * `TelegramClient.disconnect()` is explicitly awaited in a `finally` block to release file descriptors and transport sockets immediately.
+
+5. **SSRF and DNS Rebinding Protection:**
+   * `resolve_and_validate_destination` resolves hostnames and evaluates all returned IPv4/IPv6 addresses against strict private, loopback, link-local (e.g. AWS metadata `169.254.169.254`), multicast, and reserved ranges.
+   * The destination is pinned to a single validated IP address literal for subsequent TCP and Telethon connections, entirely eliminating the window for DNS rebinding attacks.
+
+6. **Transaction Discipline & Scheduling:**
+   * Claims rows via `claim_due_proxies` (`FOR UPDATE SKIP LOCKED`) in Transaction 1, commits, releases locks.
+   * MTProto network probing is executed strictly **outside** any database transaction (D-024).
+   * Transaction 2 appends immutable `ProxyObservation` rows, clears leases (`test_lock_until = None`), updates `last_test_finished_at`, and schedules next test times (1h forward for successes, 15m forward for failures).
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |

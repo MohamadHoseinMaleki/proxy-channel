@@ -27,6 +27,7 @@ from core.lifecycle import WorkerLifecycle, run_worker
 from .conftest import make_settings
 
 WORKER_MODULES = ("workers.discovery", "workers.tester", "workers.scorer")
+PLACEHOLDER_WORKERS = ("workers.discovery", "workers.scorer")
 
 EXPECTED_WORKER_NAMES = {
     "workers.discovery": "discovery-worker",
@@ -116,7 +117,7 @@ class TestProcessIndependence:
         """Importing one worker must never drag in another process's code."""
         assert "workers" not in module_imports(load(name))
 
-    @pytest.mark.parametrize("name", WORKER_MODULES)
+    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
     def test_worker_has_no_runtime_dependencies_yet(self, name: str) -> None:
         found = FORBIDDEN_IMPORTS & module_imports(load(name))
         assert not found, f"{name} imports {sorted(found)}; Task 001 workers must stay inert"
@@ -133,7 +134,7 @@ class TestProcessIndependence:
 
 
 class TestPlaceholderHonesty:
-    @pytest.mark.parametrize("name", WORKER_MODULES)
+    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
     async def test_tick_reports_itself_as_unimplemented(
         self, name: str, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
     ) -> None:
@@ -166,13 +167,13 @@ class TestPlaceholderHonesty:
         await module.tick(life)
         assert life.failure_count == 0
 
-    @pytest.mark.parametrize("name", WORKER_MODULES)
+    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
     def test_source_documents_the_pending_task(self, name: str) -> None:
         source = pathlib.Path(load(name).__file__).read_text(encoding="utf-8")
         assert "placeholder" in source.lower()
         assert "TODO" in source
 
-    @pytest.mark.parametrize("name", WORKER_MODULES)
+    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
     async def test_tick_performs_no_io(
         self, name: str, fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -207,6 +208,25 @@ class TestWorkerRunIntegration:
 
         assert await run_worker(module.WORKER_NAME, tick, settings=fast_settings, interval=0.0) == 0
         assert ticks == 2
+
+
+class TestTesterWorker:
+    async def test_tester_worker_tick_when_db_unreachable(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        """When database is unreachable, tester worker warns and exits cleanly without error."""
+        import workers.tester as tester_module
+
+        async with WorkerLifecycle(tester_module.WORKER_NAME, settings=fast_settings) as life:
+            await tester_module.tick(life)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        warn_records = [r for r in records if r["event"] == "tester_tick_db_unreachable"]
+        assert len(warn_records) == 1
+        assert warn_records[0]["worker"] == "tester-worker"
+        assert life.failure_count == 0
 
 
 class TestConsoleScripts:
