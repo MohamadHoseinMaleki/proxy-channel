@@ -115,9 +115,7 @@ class TesterService:
             update_values["last_failure_at"] = now
 
         await session.execute(
-            update(Proxy)
-            .where(Proxy.id == result.proxy_id)
-            .values(**update_values)
+            update(Proxy).where(Proxy.id == result.proxy_id).values(**update_values)
         )
 
     async def run_batch(self) -> list[TesterResult]:

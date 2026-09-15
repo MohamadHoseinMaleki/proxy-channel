@@ -113,9 +113,10 @@ class TestTesterServiceUnit:
                 total_latency_ms=35.0,
             )
 
-        with patch("modules.tester.service.claim_due_proxies", return_value=[proxy]), \
-             patch("modules.tester.service.probe_proxy", side_effect=fake_probe):
-
+        with (
+            patch("modules.tester.service.claim_due_proxies", return_value=[proxy]),
+            patch("modules.tester.service.probe_proxy", side_effect=fake_probe),
+        ):
             results = await service.run_batch()
             assert len(results) == 1
             assert results[0].success is True

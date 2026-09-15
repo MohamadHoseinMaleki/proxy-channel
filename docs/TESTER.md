@@ -36,7 +36,7 @@ against MTProxy protocols:
 * In `telethon.network.connection.tcpmtproxy.TcpMTProxy.normalize_secret`, Telethon
   parses `0xee` secrets by stripping the prefix and truncating the secret to 16 bytes:
   ```python
-  if secret.startswith(b'\xee'):
+  if secret.startswith(b"\xee"):
       # fake-TLS secret format: ee + 16-byte-secret + domain
       # for now, the domain is ignored until domain support is added
       return secret[1:17]
@@ -54,7 +54,7 @@ against MTProxy protocols:
   ```python
   # Telegram servers close the connection if we send data too fast
   # (issue #1134). So wait for the proxy to acknowledge us.
-  self._wait_for_data('proxy')
+  self._wait_for_data("proxy")
   ```
   `_wait_for_data('proxy')` enforces an unconditional **2.0-second timeout/wait**.
 * Consequently, all Telethon-measured MTProto connects have an artificial ~2-second
@@ -98,11 +98,22 @@ Every proxy undergoes a 3-phase inspection:
   - Validate hex secret syntax
   - Select transport class (Randomized Intermediate)
   - TelegramClient(MemorySession(), proxy=(pinned_ip, port, secret))
-  - await client.connect()
-  - await client.is_user_authorized() (unauthenticated RPC round-trip)
+  - await client.connect()            → MTProto_TRANSPORT_CONNECTED
+  - await client(help.GetConfigRequest())
+      require types.Config + dc_options → REAL_TELEGRAM_API_RPC_VERIFIED
   - Measure mtproto_connect_ms & total_latency_ms
   - client.disconnect() in finally block
 ```
+
+TCP success is not enough. `client.connect()` is not enough. A fresh
+`MemorySession` is never user-authorized, so `is_user_authorized() == False`
+is expected and is **not** a connectivity criterion and **not** a failure.
+
+The verification RPC is `help.getConfig` (`telethon.tl.functions.help.GetConfigRequest`,
+TL constructor `0xc4f9186b`). It does not require user login, a stored session,
+phone verification, or a bot token. Telegram answers with `types.Config`.
+Receiving that object proves the proxy forwarded a real MTProto API request
+and a valid API response.
 
 ---
 

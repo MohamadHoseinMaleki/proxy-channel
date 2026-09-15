@@ -42,8 +42,7 @@ async def run_live_test() -> int:
 
     if not server_raw or not port_raw or not secret_raw:
         print(
-            "[ERROR] PROXY_SERVER, PROXY_PORT, and PROXY_SECRET "
-            "environment variables are required."
+            "[ERROR] PROXY_SERVER, PROXY_PORT, and PROXY_SECRET environment variables are required."
         )
         return 2
 

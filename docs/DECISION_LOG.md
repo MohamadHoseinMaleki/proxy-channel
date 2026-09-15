@@ -999,6 +999,50 @@ Task 004 implements the real MTProto connectivity tester (`src/modules/tester` a
 
 ---
 
+### D-037 · Phase 3 success is unauthenticated `help.getConfig`, not `is_user_authorized()`
+
+**Context.** Task 004.1 audited the Phase 3 success criterion against Telethon 1.45.0 source. The shipped probe called `client.connect()` then `client.is_user_authorized()` and treated a non-raising call as full MTProto/API verification.
+
+**Evidence — Telethon 1.45.0 `UserMethods.is_user_authorized`:**
+
+```python
+if self._authorized is None:
+    try:
+        # Any request that requires authorization will work
+        await self(functions.updates.GetStateRequest())
+        self._authorized = True
+    except errors.RPCError:
+        self._authorized = False
+return self._authorized
+```
+
+* The RPC is `updates.GetStateRequest`, which **requires user authorization**.
+* Every `RPCError` is swallowed. A fresh `MemorySession` always takes the except branch and returns `False`.
+* Returning `False` is therefore the *normal* unauthenticated outcome, not proof that Telegram answered a usable API method, and not a proxy failure.
+* If `_authorized` is already set, **no RPC is sent at all**.
+
+`TelegramClient.connect()` already sends `InvokeWithLayer(InitConnection(help.GetConfigRequest))` and awaits the future from `MTProtoSender.send`. That is transport + init, bundled inside Telethon. It is not our explicit success criterion.
+
+**Decision.** Phase 3 success requires an explicit unauthenticated high-level RPC after `connect()`:
+
+* Request: `telethon.tl.functions.help.GetConfigRequest` (`help.getConfig`, constructor `0xc4f9186b`).
+* Success: the result is a `telethon.tl.types.Config` with a non-empty `dc_options` list.
+* Why this RPC: it works without user login, without a stored session, without phone verification, and without a bot token; it is the same method Telegram clients use during init; a valid `Config` is a real API object from Telegram, not session state.
+
+Stages that are **not** success:
+
+* TCP connect (`tcp_connect_ms` only)
+* `client.connect()` returning without error (MTProto transport / init)
+* `is_user_authorized() is False`
+
+`is_user_authorized()` is not called. `False` from it would not fail the probe.
+
+Timeouts on this RPC stay `MT_PROTO_TIMEOUT`. Raised `RPCError` stays `TELEGRAM_RPC_ERROR`. A non-`Config` result is `PROTOCOL_ERROR`. Cleanup via `client.disconnect()` in `finally` is unchanged.
+
+**Consequences.** A proxy is marked working only when Telegram answered `help.getConfig` through it. User authorization is never the connectivity criterion.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |

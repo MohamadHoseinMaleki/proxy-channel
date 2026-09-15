@@ -62,9 +62,7 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
         successes = sum(1 for r in results if r.success)
         failures = len(results) - successes
         timeouts = sum(
-            1
-            for r in results
-            if r.error_category in ("TCP_TIMEOUT", "MT_PROTO_TIMEOUT")
+            1 for r in results if r.error_category in ("TCP_TIMEOUT", "MT_PROTO_TIMEOUT")
         )
 
         life.logger.info(

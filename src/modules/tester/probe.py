@@ -4,8 +4,11 @@ Phases:
 1. DNS & SSRF Validation: Resolve server, check all addresses against SSRF rules,
    and pin the destination to a single validated IP address (prevents DNS rebinding).
 2. TCP Latency: Establish a raw TCP socket to (target_ip, port) to measure transport latency.
-3. MTProto Transport & API Verification: Initialize Telethon with MemorySession, establish
-   MTProto obfuscated connection, and verify unauthenticated RPC round-trip.
+3. MTProto Transport & API Verification: Initialize Telethon with MemorySession,
+   establish the MTProto obfuscated connection, then send unauthenticated
+   ``help.getConfig`` and require a ``types.Config`` response. TCP success and
+   ``client.connect()`` alone are not sufficient. ``is_user_authorized()`` is
+   not the connectivity criterion.
 
 Guarantees:
 * No persistent session files: uses MemorySession exclusively.
@@ -25,6 +28,8 @@ from typing import Final
 from telethon import TelegramClient
 from telethon.errors import RPCError
 from telethon.sessions import MemorySession
+from telethon.tl.functions.help import GetConfigRequest
+from telethon.tl.types import Config
 
 from core.logger import get_logger, safe_error_message
 from core.models import ErrorCategory
@@ -37,13 +42,32 @@ from modules.tester.resolver import (
 )
 from modules.tester.transport import select_transport
 
-__all__ = ["probe_proxy"]
+__all__ = ["API_VERIFY_REQUEST_CLS", "probe_proxy"]
 
 _logger = get_logger("modules.tester.probe")
 
 DEFAULT_TCP_TIMEOUT: Final = 3.0
 DEFAULT_MTPROTO_TIMEOUT: Final = 8.0
 DEFAULT_TOTAL_TIMEOUT: Final = 15.0
+
+# Canonical unauthenticated Telegram API RPC used as the Phase-3
+# REAL_TELEGRAM_API_RPC_VERIFIED criterion.
+#
+# help.getConfig (TL constructor 0xc4f9186b):
+# * does not require user login, a user session, phone verification, or a bot token
+# * is a real high-level MTProto/API request (not transport setup, not session state)
+# * returns ``types.Config`` (dc_options, this_dc, ...) from Telegram itself
+#
+# ``client.is_user_authorized()`` is intentionally NOT used: it issues
+# ``updates.GetStateRequest`` (authorization-required), swallows every
+# ``RPCError``, and returns False for a fresh MemorySession. That False is
+# not proof of API connectivity, and it is not a proxy failure either.
+API_VERIFY_REQUEST_CLS: Final[type[GetConfigRequest]] = GetConfigRequest
+
+
+def _is_verified_api_response(result: object) -> bool:
+    """True only when Telegram answered help.getConfig with a Config object."""
+    return isinstance(result, Config) and bool(getattr(result, "dc_options", None))
 
 
 async def probe_proxy(
@@ -220,8 +244,24 @@ async def _execute_probe(
         )
 
         await asyncio.wait_for(client.connect(), timeout=mtproto_timeout)
-        # Verify unauthenticated Telegram API round-trip to ensure proxy forwards RPCs
-        await asyncio.wait_for(client.is_user_authorized(), timeout=mtproto_timeout)
+        # Transport being up is not enough. Verify a real unauthenticated
+        # Telegram API RPC through the proxy and require a Config response.
+        config = await asyncio.wait_for(
+            client(API_VERIFY_REQUEST_CLS()),
+            timeout=mtproto_timeout,
+        )
+        if not _is_verified_api_response(config):
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                tcp_connect_ms=tcp_ms,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.PROTOCOL_ERROR,
+                error_message_safe=(
+                    "Unauthenticated help.getConfig did not return a Telegram Config object"
+                ),
+                transport_type=selection.transport_type,
+            )
 
         mtp_ms = (time.monotonic() - t_mtp) * 1000.0
         total_ms = (time.monotonic() - t_start) * 1000.0

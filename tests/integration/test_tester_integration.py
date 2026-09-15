@@ -73,9 +73,11 @@ async def test_tester_batch_claiming_and_observation_persistence(db: Database) -
 
     # 3. Verify observations were stored in database
     async with db.session_scope() as session:
-        obs_rows = (await session.execute(
-            select(ProxyObservation).order_by(ProxyObservation.proxy_id)
-        )).scalars().all()
+        obs_rows = (
+            (await session.execute(select(ProxyObservation).order_by(ProxyObservation.proxy_id)))
+            .scalars()
+            .all()
+        )
 
         assert len(obs_rows) == 2
         obs_p1 = obs_rows[0]
@@ -91,9 +93,7 @@ async def test_tester_batch_claiming_and_observation_persistence(db: Database) -
         assert obs_p2.error_message_safe == "MTProto handshake timeout"
 
         # 4. Verify proxy rows were updated and leases released
-        proxies = (await session.execute(
-            select(Proxy).order_by(Proxy.id)
-        )).scalars().all()
+        proxies = (await session.execute(select(Proxy).order_by(Proxy.id))).scalars().all()
 
         assert len(proxies) == 2
         # Both proxies must have cleared their lease
