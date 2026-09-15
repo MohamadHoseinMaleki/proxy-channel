@@ -1,5 +1,7 @@
-# Environments
+# Environments & secrets -- never commit these
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -12,16 +14,31 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# IDE / Tooling
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tooling caches
 .vscode/
 .idea/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
 htmlcov/
+.coverage
+coverage.xml
 
-# Local data & secrets
+# Local data & generated output
 *.sqlite3
 *.db
 results.json
+telethon_results.json
+pyrogram_results.json
+reports/
 *.log
+
+# OS noise
+.DS_Store
+Thumbs.db

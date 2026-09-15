@@ -1,5 +1,36 @@
 # MTProto Library Spike Report
 
+> ## ⚠️ CORRECTION — read `spike/AUDIT.md` before relying on this document
+>
+> **Audited 2026-09-15 (Task 001).** This report is retained verbatim for
+> history, but its section 2 "Raw Findings" are **not reproducible from the
+> committed spike code** and two are contradicted by the library itself:
+>
+> * `spike_pyrogram.py` is a **non-executable stub** (empty `TEST_CASES`,
+>   `check_tcp` body is `pass`, no `main()`), so *no* Pyrogram result here is
+>   supported by any artifact.
+> * `TelegramClient.connect()` is annotated **`-> None`** and never returns
+>   `True`, so `if connected:` in `spike_telethon.py` was **always False** — a
+>   genuinely successful connection would have been logged as `LIBRARY_ERROR`.
+> * All four spike fixtures use **`ee` (fake-TLS) secrets**, which the pinned
+>   **Telethon 1.34.0 rejects with `ValueError` before opening a socket**.
+>   Support arrived in **Telethon 1.35.0** via `TcpMTProxy.normalize_secret`.
+> * The spike wrote **`.session` SQLite files to disk** while claiming an
+>   in-memory session.
+> * No results file was ever committed. **No latency or success figure in this
+>   repository has been measured against a real proxy.**
+>
+> **Still valid:** the section 6 recommendation of **Telethon**, and the section
+> 4 reasoning that a wrong secret is indistinguishable from a blackholed proxy
+> (retained as a hypothesis, which is why `WRONG_SECRET` is excluded from the
+> error taxonomy).
+>
+> Verified replacement: `spike/verify_telethon_contract.py` + `spike/evidence/`.
+> Binding consequences for the tester are listed in `spike/AUDIT.md` §4.
+
+---
+
+
 ## 1. Environment
 * Python 3.11.4
 * Telethon 1.34.0
