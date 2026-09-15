@@ -782,9 +782,9 @@ Two independent guards, different exceptions — both pinned in tests so nobody
 
 ### D-033 · Cross-platform failures are reproduced on Linux, not skipped
 
-Two bugs were found only because the suite was run on Windows. Neither was a
-Windows bug in the strict sense — both were *narrow assumptions* that happened to
-hold on the only platform being tested.
+Three cross-platform issues were found only because the suite was run on Windows.
+None was a Windows bug in the strict sense — each was a *narrow assumption* that
+happened to hold on the only platform being tested.
 
 **(a) Clock granularity.** `time.monotonic()` on Linux has 1 ns resolution
 (`clock_gettime(CLOCK_MONOTONIC)`); on Windows it advances in ~15.6 ms quanta
@@ -809,6 +809,18 @@ Both handlers are now `except Exception`. This is not laziness — it is what th
 docstring already promised, and `CancelledError` derives from `BaseException` so
 cooperative cancellation still propagates.
 
+**(c) Windows signal delivery via `os.kill`.** `os.kill(os.getpid(), signal.SIGTERM)`
+on Linux sends a catchable POSIX signal to the process; on Windows, `os.kill` for
+any signal other than `SIGINT`/`SIGBREAK` calls `TerminateProcess()` directly,
+terminating the runner process unconditionally without running any Python signal
+handlers. Even for `SIGINT`, `os.kill` delegates to `GenerateConsoleCtrlEvent`,
+which requires a console process group ID and does not map to event loop signal
+listeners. The tests `test_real_sigterm_requests_graceful_shutdown` and
+`test_running_loop_stops_on_real_signal` specifically test POSIX signal
+integration through the event loop; on Windows they now skip cleanly with an
+explanatory message, while `test_fallback_handler_used_when_loop_cannot`
+continues to verify the Windows fallback signal mechanism.
+
 **Rationale.** A guard that only fails on an untested platform is worse than no
 guard, because CI keeps reporting green. So each failure was converted into a
 test that reproduces the platform *here*:
@@ -817,13 +829,14 @@ test that reproduces the platform *here*:
 |---|---|
 | 15.6 ms monotonic quanta | `monkeypatch`ing `time.monotonic` to `int(t / 0.015625) * 0.015625` |
 | Driver rejecting a Unix-socket DSN | `monkeypatch`ing `AsyncEngine.connect` to raise `NotImplementedError` |
+| Windows `os.kill` terminating process | `monkeypatch`ing `sys.platform` to `win32` and asserting clean skips |
 
-Both are exact stand-ins for the real thing, so `test_survives_a_coarse_monotonic_clock`,
-`test_is_reachable_survives_a_failure_type_nobody_enumerated` and
-`test_returns_false_when_the_driver_rejects_the_dsn_for_platform_reasons` now run
-in every CI job rather than only on the machine that discovered them. Running the
-whole unit suite under the quantised clock yields **499 passed** — the same as
-without it, which is the point.
+All are exact stand-ins for the real thing, so `test_survives_a_coarse_monotonic_clock`,
+`test_is_reachable_survives_a_failure_type_nobody_enumerated`,
+`test_returns_false_when_the_driver_rejects_the_dsn_for_platform_reasons`, and
+`test_skips_real_os_kill_on_windows` now run in every CI job rather than only on
+the machine that discovered them. Running the whole unit suite under the quantised
+clock yields **500 passed** — the same as without it, which is the point.
 
 **Consequences.** `ping()`'s docstring now states the failure-type list is
 open-ended and points at `is_reachable()` as the safe entry point, so the next

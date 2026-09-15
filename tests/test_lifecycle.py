@@ -276,6 +276,16 @@ class TestRunLoop:
 
 
 class TestSignalHandling:
+    async def test_skips_real_os_kill_on_windows(
+        self, fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On Windows, os.kill(pid, SIGTERM) calls TerminateProcess and kills the runner."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(pytest.skip.Exception):
+            await self.test_real_sigterm_requests_graceful_shutdown(fast_settings)
+        with pytest.raises(pytest.skip.Exception):
+            await self.test_running_loop_stops_on_real_signal(fast_settings)
+
     async def test_candidate_signals_are_platform_appropriate(self) -> None:
         names = {signal.Signals(s).name for s in _candidate_signals()}
         assert "SIGINT" in names
@@ -298,6 +308,8 @@ class TestSignalHandling:
 
     async def test_real_sigterm_requests_graceful_shutdown(self, fast_settings: Settings) -> None:
         """End-to-end Linux signal handling through the running event loop."""
+        if sys.platform == "win32":
+            pytest.skip("Windows os.kill(pid, SIGTERM) calls TerminateProcess and cannot be caught")
         life = WorkerLifecycle("tester", settings=fast_settings)
         handled = life.install_signal_handlers()
         if "SIGTERM" not in handled:  # pragma: no cover - platform guard
@@ -317,6 +329,8 @@ class TestSignalHandling:
 
     async def test_running_loop_stops_on_real_signal(self, fast_settings: Settings) -> None:
         """``run()`` must return promptly after SIGINT instead of hanging."""
+        if sys.platform == "win32":
+            pytest.skip("Windows os.kill does not deliver catchable signals to a running loop")
         life = WorkerLifecycle("discovery", settings=fast_settings)
         handled = life.install_signal_handlers()
         if "SIGINT" not in handled:  # pragma: no cover - platform guard

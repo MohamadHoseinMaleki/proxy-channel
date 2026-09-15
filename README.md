@@ -85,7 +85,7 @@ src/
 alembic/                     # async migrations; no DSN in alembic.ini
 scripts/dev_pg.py            # local PostgreSQL without Docker (pgserver, ad hoc)
 infra/docker/                # optional compose file, for people who run Docker
-tests/                       # 499 unit tests; no network, no database
+tests/                       # 500 unit tests; no network, no database
 tests/integration/           # 163 tests against a real PostgreSQL 16
 spike/                       # protocol engine evaluation + its audit
 docs/DATABASE.md             # schema, identity, secrets, claiming, indexes
@@ -102,7 +102,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 499 passed, 163 skipped (no database)
+uv run pytest                  # 500 passed, 163 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # 34 files already formatted
 uv run mypy .                  # Success: no issues found in 31 source files
@@ -114,7 +114,7 @@ To also run the 163 integration tests, provision a local PostgreSQL — Docker i
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 662 passed
+                               # 663 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any
@@ -131,7 +131,7 @@ POSTGRES_PASSWORD=... docker compose -f infra/docker/docker-compose.yml up -d
 It binds to `127.0.0.1` only and refuses to start without an explicit password —
 no credential is committed. See [D-034](docs/DECISION_LOG.md).
 
-**Platform notes.** The 499 unit tests are cross-platform and verified on both
+**Platform notes.** The 500 unit tests are cross-platform and verified on both
 Linux and Windows — no database, no network, no filesystem assumptions. The 163
 integration tests need a real PostgreSQL; without one they **skip with a
 message**, they never fail. `scripts/dev_pg.py` has only been exercised on Linux,
