@@ -381,3 +381,16 @@ class TestHideParameters:
     def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DB_HIDE_PARAMETERS", "false")
         assert build_settings(env_file=None).db_hide_parameters is False
+
+
+class TestScorerBatchSize:
+    def test_defaults_to_fifty(self) -> None:
+        assert make_settings().scorer_batch_size == 50
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SCORER_BATCH_SIZE", "12")
+        assert build_settings(env_file=None).scorer_batch_size == 12
+
+    def test_rejects_non_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(scorer_batch_size=0)

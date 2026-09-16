@@ -27,7 +27,7 @@ from core.lifecycle import WorkerLifecycle, run_worker
 from .conftest import make_settings
 
 WORKER_MODULES = ("workers.discovery", "workers.tester", "workers.scorer")
-PLACEHOLDER_WORKERS = ("workers.discovery", "workers.scorer")
+PLACEHOLDER_WORKERS = ("workers.discovery",)
 
 EXPECTED_WORKER_NAMES = {
     "workers.discovery": "discovery-worker",
@@ -227,6 +227,62 @@ class TestTesterWorker:
         assert len(warn_records) == 1
         assert warn_records[0]["worker"] == "tester-worker"
         assert life.failure_count == 0
+
+
+class TestScorerWorker:
+    async def test_scorer_worker_tick_when_db_unreachable(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        """When database is unreachable, scorer warns and exits cleanly without error."""
+        import workers.scorer as scorer_module
+
+        async with WorkerLifecycle(scorer_module.WORKER_NAME, settings=fast_settings) as life:
+            await scorer_module.tick(life)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        warn_records = [r for r in records if r["event"] == "scorer_tick_db_unreachable"]
+        assert len(warn_records) == 1
+        assert warn_records[0]["worker"] == "scoring-worker"
+        assert life.failure_count == 0
+
+    async def test_scoring_exception_does_not_kill_the_worker(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import workers.scorer as scorer_module
+        from core.lifecycle import run_worker
+
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            worker_error_backoff_seconds=0.0,
+            worker_max_error_backoff_seconds=0.0,
+        )
+        ticks = 0
+
+        async def tick(life: WorkerLifecycle) -> None:
+            nonlocal ticks
+            ticks += 1
+            if ticks >= 2:
+                life.request_shutdown("test-complete")
+                return
+            fake_db = AsyncMock()
+            fake_db.is_reachable = AsyncMock(return_value=True)
+            fake_db.dispose = AsyncMock()
+            with (
+                patch("workers.scorer.Database.from_settings", return_value=fake_db),
+                patch(
+                    "workers.scorer.ScoringService.run_batch",
+                    side_effect=RuntimeError("scoring boom"),
+                ),
+            ):
+                await scorer_module.tick(life)
+
+        assert (
+            await run_worker(scorer_module.WORKER_NAME, tick, settings=settings, interval=0.0) == 0
+        )
+        assert ticks == 2
 
 
 class TestConsoleScripts:

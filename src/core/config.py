@@ -138,6 +138,12 @@ class Settings(BaseSettings):
     tester_total_timeout_seconds: float = Field(default=15.0, gt=0)
     tester_batch_size: int = Field(default=25, ge=1, le=200)
 
+    # --- Scorer (Task 005) -------------------------------------------------
+    #: How many proxies to score per tick. Formula constants live in
+    #: ``modules.scoring.calculator`` so a settings change cannot silently
+    #: fork ``scoring_version=v1``.
+    scorer_batch_size: int = Field(default=50, ge=1, le=500)
+
     # --- Validation --------------------------------------------------------
 
     @field_validator("log_level", "third_party_log_level", mode="before")

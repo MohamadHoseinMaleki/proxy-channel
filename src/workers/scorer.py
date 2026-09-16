@@ -1,12 +1,7 @@
 """``scoring-worker`` -- Process C.
 
-Responsibility: aggregate observations into deterministic per-proxy scores.
-
-.. warning::
-   **Status: placeholder (Task 001).** The tick below only proves that this
-   process starts, configures logging, handles signals and shuts down cleanly.
-   It calculates *no* scores. The metrics engine lands in Task 008 and the
-   scoring worker loop in Task 009.
+Responsibility: turn persisted ``ProxyObservation`` history into append-only
+``ProxyScore`` snapshots. No network I/O. No mutation of observations.
 
 Run with::
 
@@ -19,29 +14,47 @@ from __future__ import annotations
 
 import time
 
+from core.database import Database
 from core.lifecycle import WorkerLifecycle, worker_main
+from modules.scoring.service import ScoringService
 
 __all__ = ["WORKER_NAME", "main", "tick"]
 
 WORKER_NAME = "scoring-worker"
 
-_IMPLEMENTATION_TASKS = ("task-008-scoring", "task-009-scorer-worker")
 
-
-async def tick(life: WorkerLifecycle) -> None:
-    """One scoring iteration. Currently a heartbeat only."""
+async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
+    """One scoring iteration: claim due proxies, score, persist snapshots."""
     started = time.monotonic()
+    dispose_db = False
 
-    # TODO(task-008/009): select proxies needing recalculation, aggregate
-    # observations over 1h/6h/24h windows, upsert one ProxyScore row per proxy.
-    life.logger.info(
-        "scorer_tick",
-        implemented=False,
-        pending_tasks=list(_IMPLEMENTATION_TASKS),
-        proxies_scored=0,
-        scores_calculated=0,
-        duration_ms=round((time.monotonic() - started) * 1000, 3),
-    )
+    if db is None:
+        db = Database.from_settings(life.settings)
+        dispose_db = True
+
+    try:
+        if not await db.is_reachable():
+            life.logger.warning(
+                "scorer_tick_db_unreachable",
+                worker=WORKER_NAME,
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
+            return
+
+        service = ScoringService(db, batch_size=life.settings.scorer_batch_size)
+        results = await service.run_batch()
+
+        life.logger.info(
+            "scorer_tick",
+            implemented=True,
+            proxies_scored=len(results),
+            scores_calculated=len(results),
+            empty_windows=sum(1 for item in results if item.observation_count == 0),
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+        )
+    finally:
+        if dispose_db:
+            await db.dispose()
 
 
 def main() -> None:

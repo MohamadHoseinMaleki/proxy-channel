@@ -1043,6 +1043,28 @@ Timeouts on this RPC stay `MT_PROTO_TIMEOUT`. Raised `RPCError` stays `TELEGRAM_
 
 ---
 
+### D-038 · Deterministic v1 scoring; no schema change; no score lease column
+
+**Context.** Task 005 converts persisted `ProxyObservation` rows into quality snapshots. `proxy_scores` already exists as append-only history (D-022) with `score`, windowed `reliability_*`, `latency_p{50,95}_ms`, `sample_count_*`, and `scoring_version`. `ProxyObservation.success` is the Task 004.1 API-verification bit.
+
+**Decision — no migration.** Existing columns already store what ranking and reporting need. Intermediate components (`reliability_score`, `latency_score`, `confidence_score`) are computed in process and are recoverable from observations, so they are not duplicated on the table.
+
+**Decision — formula (`scoring_version = v1`).** Pure function, no I/O, no RNG. 24 h lookback. Recency `w = exp(-ln(2) * age_hours / 6)` (true half-life 6 h: several tester intervals; not a fitted optimum). Reliability is Laplace-smoothed decay-weighted success rate. Latency uses successful `mtproto_connect_ms` only, linearly mapped so 0 ms → 100 and 8000 ms (tester MTProto timeout) → 0. Telethon's ~2 s floor is **not** subtracted. Timeouts are not turned into millisecond values. Confidence `n / (n + 10)` so `1/1` cannot outrank `100/100`. Final:
+
+```
+score = (0.75 * reliability_score + 0.25 * latency_score) * n / (n + 10)
+```
+
+Constants live in code, not env, so two workers cannot silently fork v1. Only `SCORER_BATCH_SIZE` is a setting.
+
+**Decision — claiming.** A proxy is due when `is_active`, `last_test_finished_at` is set, and no v1 `ProxyScore` has `calculated_at >= last_test_finished_at`. Workers `SELECT … FOR UPDATE SKIP LOCKED`. Scoring has **no network I/O**, so the row lock is held only for the short read-compute-insert transaction. No `score_lock_until` / `next_score_at` columns, and `test_lock_until` is not reused (that lease belongs to the tester). A crash rolls back; another worker can take the row immediately.
+
+**Decision — no ML / no LLM.** Scoring is an engineering metric over measurements. Qwen stays out of this path.
+
+**Consequences.** Observations remain immutable. Each run inserts a new snapshot. Empty 24 h windows persist `score = 0` with NULL window reliabilities so the proxy is not claimed again until the next test.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |

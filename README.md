@@ -15,22 +15,15 @@ Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Task 001 complete — foundation only
+## ⚠️ Current status: Tasks 001–005 complete
 
-**Nothing in this repository discovers, tests or scores a proxy yet.**
+Discovery, testing and **deterministic scoring** are implemented. The discovery
+worker is still a placeholder (`implemented=False`). The tester and scorer
+workers do real work against PostgreSQL.
 
-The three workers start, configure structured logging, handle signals, run a
-heartbeat loop and shut down cleanly. Their ticks are **placeholders** and say so
-in every log line (`implemented=False`). There is no database layer, no parser,
-no tester and no scorer.
-
-This is enforced mechanically, not by convention — `tests/test_workers.py` parses
-each worker's AST and fails if it imports `telethon`, `sqlalchemy`, `asyncpg` or
-`socket`, and asserts the placeholder flag is present in the rendered output.
-
-**No proxy has been tested from this environment. No latency, success-rate or
-uptime figure in this repository was measured against a real proxy.** See
-[`spike/AUDIT.md`](spike/AUDIT.md).
+**No live public proxy was measured in this environment.** Unit and integration
+scores are computed from persisted (often synthetic) observations. See
+[`spike/AUDIT.md`](spike/AUDIT.md) and [`docs/SCORING.md`](docs/SCORING.md).
 
 ### Task progress
 
@@ -39,9 +32,9 @@ uptime figure in this repository was measured against a real proxy.** See
 | 001 | Foundation: config, logging, lifecycle, worker entrypoints, tests | ✅ **complete** |
 | 002 | PostgreSQL layer: 5 models, indexes, Alembic | ✅ **complete** |
 | 003 | MTProto link parsing, normalisation, discovery layer | ✅ **complete** |
-| 004 | Discovery engine + source abstraction | ⬜ not started |
-| 005 | Telethon MTProto tester (3 phases) | ⬜ not started — **read `spike/AUDIT.md` §4 first** |
-| 006–009 | Tester worker, observations, scoring, scorer worker | ⬜ not started |
+| 004 | Telethon MTProto tester (3 phases, `help.getConfig`) | ✅ **complete** |
+| 005 | Deterministic scoring engine + scorer worker | ✅ **complete** |
+| 006–009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
 | 010–012 | Reporting, Telegram publishing, AI content | ⬜ not started |
 | 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
@@ -79,8 +72,8 @@ src/
 │   └── scheduling.py        # FOR UPDATE SKIP LOCKED claim primitive
 └── workers/
     ├── discovery.py         # Process A — placeholder
-    ├── tester.py            # Process B — placeholder
-    └── scorer.py            # Process C — placeholder
+    ├── tester.py            # Process B — MTProto probe + observations
+    └── scorer.py            # Process C — deterministic ProxyScore snapshots
 
 alembic/                     # async migrations; no DSN in alembic.ini
 scripts/dev_pg.py            # local PostgreSQL without Docker (pgserver, ad hoc)
@@ -90,6 +83,8 @@ tests/integration/           # 167 tests against a real PostgreSQL 16
 spike/                       # protocol engine evaluation + its audit
 docs/DATABASE.md             # schema, identity, secrets, claiming, indexes
 docs/DISCOVERY.md            # parsing, normalization, SSRF, persistence
+docs/TESTER.md               # three-phase probe, help.getConfig, Fake-TLS limit
+docs/SCORING.md              # v1 formula, confidence, recency, limitations
 docs/DECISION_LOG.md         # every constraining decision, with evidence
 ```
 
@@ -103,19 +98,19 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 641 passed, 167 skipped (no database)
+uv run pytest                  # 716 passed, 177 skipped (no database)
 uv run ruff check .            # All checks passed
-uv run ruff format --check .   # 50 files already formatted
-uv run mypy .                  # Success: no issues found in 47 source files
+uv run ruff format --check .   # files already formatted
+uv run mypy .                  # Success: no issues found in 63 source files
 ```
 
-To also run the 167 integration tests, provision a local PostgreSQL — Docker is
+To also run the 177 integration tests, provision a local PostgreSQL — Docker is
 **not** required:
 
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 808 passed
+                               # 893 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any
