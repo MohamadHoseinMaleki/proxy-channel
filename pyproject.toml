@@ -16,12 +16,16 @@ dependencies = [
     "alembic>=1.14.0",
     "httpx>=0.28.1",
     "telethon>=1.35.0",
+    # --- HTTP ranking API (Task 007) ---
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
 ]
 
 [project.scripts]
 mtproto-discovery = "workers.discovery:main"
 mtproto-tester = "workers.tester:main"
 mtproto-scorer = "workers.scorer:main"
+mtproto-api = "workers.api:main"
 
 [dependency-groups]
 dev = [

@@ -297,7 +297,23 @@ class TestConsoleScripts:
             "mtproto-discovery": "workers.discovery:main",
             "mtproto-tester": "workers.tester:main",
             "mtproto-scorer": "workers.scorer:main",
+            "mtproto-api": "workers.api:main",
         }
+
+    def test_api_process_is_not_a_tick_worker(self) -> None:
+        """Uvicorn owns signals; merging the API into WorkerLifecycle races D-006."""
+        module = load("workers.api")
+        imported = module_imports(module)
+        assert "uvicorn" in imported
+        assert "core.lifecycle" not in imported
+        source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and node.module and "lifecycle" in node.module:
+                msg = "API process must not import WorkerLifecycle"
+                raise AssertionError(msg)
+        assert "run_worker" not in source
+        assert "uvicorn.run" in source
+        assert "access_log=False" in source
 
     def test_every_declared_script_resolves(self) -> None:
         import tomllib

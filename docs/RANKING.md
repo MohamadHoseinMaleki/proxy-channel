@@ -6,9 +6,9 @@ Expose the **best currently-known** proxies from persisted Task 005
 `ProxyScore` snapshots. Ranking does not probe the network, does not
 recalculate scores, and does not change tester or scorer scheduling.
 
-There is no HTTP framework in this repository (D-016). The serving contract
-is `RankingService.list_top` returning a `RankingPage` of `ProxyListing`
-values. A public transport (Task 010) can sit on top of this later.
+The serving contract is `RankingService.list_top` returning a `RankingPage`
+of `ProxyListing` values. HTTP is a thin adapter in Task 007
+([`docs/API.md`](API.md), D-041) and must not reimplement this module.
 
 ```
 PostgreSQL  (proxies ⋈ latest proxy_scores)
@@ -122,8 +122,8 @@ Bounded first page only.
 | Keyset cursor | deferred until a public transport exists |
 
 The query applies `LIMIT` in SQL after latest-per-proxy + eligibility.
-There is no serving protocol yet; inventing signed cursors would add a key
-and a page token with no consumer. OFFSET is still rejected.
+HTTP `GET /v1/proxies` (Task 007) exposes this page. OFFSET is still
+rejected. Keyset cursors would add a signing secret with no consumer yet.
 
 ## Security exclusions
 
@@ -160,7 +160,8 @@ to the fetched page so unit tests and SQL share one definition.
 
 ## Limitations
 
-* First page only. Deep pagination waits for a transport (Task 010).
+* First page only. HTTP `GET /v1/proxies` (Task 007) exposes that page;
+  deep pagination is still deferred.
 * Fake-TLS (`ee`) proxies that the tester marks `UNSUPPORTED_TRANSPORT`
   score as dead and, if they have samples, may appear at the bottom.
 * Serving 24 h freshness assumes the scorer is running. If it is down,

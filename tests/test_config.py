@@ -394,3 +394,29 @@ class TestScorerBatchSize:
     def test_rejects_non_positive(self) -> None:
         with pytest.raises(ValidationError):
             make_settings(scorer_batch_size=0)
+
+
+class TestApiBind:
+    def test_defaults_to_loopback_8080(self) -> None:
+        settings = make_settings()
+        assert settings.api_host == "127.0.0.1"
+        assert settings.api_port == 8080
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("API_HOST", "0.0.0.0")
+        monkeypatch.setenv("API_PORT", "9000")
+        settings = build_settings(env_file=None)
+        assert settings.api_host == "0.0.0.0"
+        assert settings.api_port == 9000
+
+    def test_strips_host_whitespace(self) -> None:
+        assert make_settings(api_host="  127.0.0.1  ").api_host == "127.0.0.1"
+
+    def test_rejects_empty_host(self) -> None:
+        with pytest.raises(ValidationError, match="api_host"):
+            make_settings(api_host="   ")
+
+    @pytest.mark.parametrize("port", [0, -1, 65536])
+    def test_rejects_out_of_range_port(self, port: int) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(api_port=port)

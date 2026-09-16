@@ -76,8 +76,8 @@ class Settings(BaseSettings):
 
     Environment variables are matched case-insensitively, so ``LOG_LEVEL`` and
     ``log_level`` are equivalent.  Unknown variables are ignored on purpose: the
-    same ``.env`` file is shared by three independent worker processes plus
-    future modules, and no single process consumes all of it.
+    same ``.env`` file is shared by the worker processes and the ranking API,
+    and no single process consumes all of it.
     """
 
     model_config = SettingsConfigDict(
@@ -144,6 +144,11 @@ class Settings(BaseSettings):
     #: fork ``scoring_version=v1``.
     scorer_batch_size: int = Field(default=50, ge=1, le=500)
 
+    # --- HTTP ranking API (Task 007) ---------------------------------------
+    #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.
+    api_host: str = Field(default="127.0.0.1")
+    api_port: int = Field(default=8080, ge=1, le=65535)
+
     # --- Validation --------------------------------------------------------
 
     @field_validator("log_level", "third_party_log_level", mode="before")
@@ -168,6 +173,17 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             value = value.strip()
             return value or "unset"
+        return value
+
+    @field_validator("api_host", mode="before")
+    @classmethod
+    def _normalise_api_host(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                msg = "api_host must not be empty"
+                raise ValueError(msg)
+            return stripped
         return value
 
     @field_validator("worker_max_error_backoff_seconds")

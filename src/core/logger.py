@@ -315,6 +315,10 @@ def configure_logging(settings: Settings | None = None, *, force: bool = False) 
         "telethon",
         "pyrogram",
         "asyncpg",
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "fastapi",
     )
     for name in noisy_loggers:
         logging.getLogger(name).setLevel(noisy_level)

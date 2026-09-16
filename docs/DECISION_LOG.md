@@ -8,6 +8,52 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 007 — Read-only ranking HTTP transport
+
+### D-041 · FastAPI + Uvicorn as a **separate** ranking adapter; D-016/D-040 HTTP ban is superseded for this process only
+
+**Context.** Task 006 shipped `RankingService.list_top` with no web framework
+(D-040), matching D-016 ("No FastAPI"). Task 007 needs the smallest production
+HTTP surface over that service. The ranking domain must not move into routes.
+
+**Decision.**
+
+1. **FastAPI + Uvicorn only.** No Flask, Django, Sanic, or aiohttp. `httpx` was
+   already a project dependency; FastAPI/Uvicorn are added as runtime deps for
+   this process.
+2. **Separate OS process** (`mtproto-api` → `workers.api:main`). Not a fourth
+   tick on `WorkerLifecycle`. Uvicorn owns SIGINT/SIGTERM; installing D-006
+   handlers alongside it would race shutdown.
+3. **Adapter only.** Routes call `RankingService.list_top(limit=…)`. No
+   duplicate eligibility/order SQL. No public `as_of` — the service stamps
+   `utcnow()`. Query `limit` is `1..100` (same bounds as ranking policy).
+4. **Bind loopback by default** (`API_HOST=127.0.0.1`, `API_PORT=8080`). A
+   public interface is an operator override, not the MVP.
+5. **Ops vs ranking.** `GET /healthz` is liveness (no DB). `GET /readyz` is
+   `Database.is_reachable` only — empty ranking is still ready; DB failure is
+   `503` with no SQL/exception leak.
+6. **Generic errors.** FastAPI `422` is rewritten to `400` `{"detail":"invalid
+   request"}`. `500` is `{"detail":"internal error"}`. Bodies never echo
+   rejected values, secrets, or tracebacks.
+7. **No Redis, no rate-limit backend, no app-level ranking cache.** Optional
+   `Cache-Control: public, max-age=30` on listings is a hint for a reverse
+   proxy, not a store.
+8. **Request IDs.** `x-request-id` echoed when it matches
+   `[A-Za-z0-9._-]{1,64}`; otherwise minted. Oversized headers are discarded
+   and never logged.
+
+**Evidence.** Unit tests drive the ASGI app with `httpx.ASGITransport` and a
+mocked database. Integration tests hit real PostgreSQL through the same app
+factory. OpenAPI is asserted free of ORM models, secrets, fingerprints, and
+`as_of`.
+
+**Consequences.** D-016 and D-040 still forbid Redis/Celery/K8s and still
+forbid putting ranking *logic* in a web framework. They no longer forbid this
+HTTP adapter. Task 005 formula and Task 006 SQL are unchanged. Discovery,
+tester, and scorer stay independent processes.
+
+---
+
 ## Task 001 — Foundation
 
 ### D-001 · The repository did **not** contain the foundation described in the brief; Task 001 built it
@@ -196,7 +242,7 @@ that is to never construct such messages, which is why the tester logs
 
 **Decision.** `LOG_LEVEL` controls the platform; `THIRD_PARTY_LOG_LEVEL`
 (default `WARNING`) controls `asyncio`, `sqlalchemy.engine`, `sqlalchemy.pool`,
-`telethon`, `pyrogram`, `asyncpg`.
+`telethon`, `pyrogram`, `asyncpg` (and, from Task 007, `uvicorn` / `fastapi`).
 
 **Context.** This was found by a failing test, not by taste: setting
 `LOG_LEVEL=DEBUG` let asyncio's `Using selector: EpollSelector` debug line into
@@ -355,7 +401,7 @@ are all unit-level: no database, no network.
 
 ### D-016 · Explicitly out of scope for the MVP
 
-No Redis. No Celery. No FastAPI. No Cloudflare Workers. No Kubernetes. No
+No Redis. No Celery. No FastAPI *(superseded for the ranking HTTP adapter by D-041)*. No Cloudflare Workers. No Kubernetes. No
 microservice framework. No SOCKS5/HTTP/VLESS/VMess/Trojan/Xray/Shadowsocks —
 **MTProto only**. PostgreSQL is the work-coordination mechanism
 (`FOR UPDATE SKIP LOCKED`, Task 006/014).
@@ -1083,7 +1129,7 @@ Constants live in code, not env, so two workers cannot silently fork v1. Only `S
 
 **Context.** Task 006 needs a deterministic serving contract on append-only `ProxyScore` snapshots. D-016 forbids FastAPI/Redis. D-022 already indexed "latest score per proxy" as `ix_proxy_scores_proxy_id_calculated_at`.
 
-**Decision — no web framework.** `RankingService.list_top` is the serving API. A later publisher (Task 010) can wrap it. Introducing FastAPI here would reverse D-016 for no consumer.
+**Decision — no web framework in Task 006.** `RankingService.list_top` is the serving API. Introducing FastAPI here would reverse D-016 for no consumer. **HTTP transport is D-041** (Task 007): a separate FastAPI process *calls* `list_top`; it does not replace this module.
 
 **Decision — latest = max `(calculated_at, id)` among `scoring_version = v1`.** PostgreSQL `DISTINCT ON (proxy_id) ORDER BY proxy_id, calculated_at DESC, id DESC`. One listing per proxy. An unserviceable latest row (stale, empty window) does **not** fall back to an older snapshot.
 

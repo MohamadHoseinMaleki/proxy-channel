@@ -8,19 +8,20 @@ proxies.
 > Can we continuously discover, validate, measure and score public MTProto
 > proxies well enough to identify high-quality usable candidates?
 
-The MVP is deliberately small and reliable: three independent Python processes
-coordinated only through PostgreSQL. No Redis, no Celery, no FastAPI, no
-Kubernetes, no message broker. MTProto only — no SOCKS5, HTTP, VLESS, VMess,
-Trojan, Xray or Shadowsocks.
+The MVP is deliberately small and reliable: three independent worker processes
+coordinated only through PostgreSQL, plus a read-only ranking HTTP process.
+No Redis, no Celery, no Kubernetes, no message broker. MTProto only — no
+SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–006 complete
+## ⚠️ Current status: Tasks 001–007 complete
 
-Discovery, testing, deterministic scoring, and **read-only ranking** are
-implemented. The discovery worker is still a placeholder (`implemented=False`).
-The tester and scorer workers do real work against PostgreSQL. There is no
-HTTP API (D-016 / D-040): `RankingService.list_top` is the serving contract.
+Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
+API** are implemented. The discovery worker is still a placeholder
+(`implemented=False`). The tester and scorer workers do real work against
+PostgreSQL. HTTP is an adapter over `RankingService.list_top` (D-041);
+it does not rediscover, retest, or rescore.
 
 **No live public proxy was measured in this environment.** Unit and integration
 scores are computed from persisted (often synthetic) observations. See
@@ -36,7 +37,8 @@ scores are computed from persisted (often synthetic) observations. See
 | 004 | Telethon MTProto tester (3 phases, `help.getConfig`) | ✅ **complete** |
 | 005 | Deterministic scoring engine + scorer worker | ✅ **complete** |
 | 006 | Ranking & serving layer over latest `ProxyScore` | ✅ **complete** |
-| 007–009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
+| 007 | Read-only ranking HTTP transport (FastAPI + Uvicorn) | ✅ **complete** |
+| 008–009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
 | 010–012 | Reporting, Telegram publishing, AI content | ⬜ not started |
 | 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
@@ -46,15 +48,15 @@ scores are computed from persisted (often synthetic) observations. See
 
 ```
                         Managed PostgreSQL
-                        /       |       \
-                       /        |        \
-                      /         |         \
-             Discovery       Tester      Scorer
-               worker        worker      worker
-                 │              │           │
-                 └──────────────┴───────────┘
-              three INDEPENDENT OS processes
-        coordinated only by SQL (FOR UPDATE SKIP LOCKED)
+                   /      |       |       \
+                  /       |       |        \
+           Discovery   Tester  Scorer   ranking API
+             worker    worker  worker   (mtproto-api)
+                 │        │       │          │
+                 └────────┴───────┴──────────┘
+        independent OS processes; workers coordinate
+        only by SQL (FOR UPDATE SKIP LOCKED). The API
+        is read-only and never claims rows.
 ```
 
 A crash, `kill -9` or OOM in one worker must not affect the others. They share no
@@ -72,23 +74,26 @@ src/
 │   └── database.py          # async engine, session_scope, teardown
 ├── modules/                 # domain logic (populated by Tasks 003–012)
 │   ├── scheduling.py        # FOR UPDATE SKIP LOCKED claim primitive
-│   └── ranking/             # latest-score ranking, secret-safe listings
+│   ├── ranking/             # latest-score ranking, secret-safe listings
+│   └── api/                 # FastAPI adapter over RankingService
 └── workers/
     ├── discovery.py         # Process A — placeholder
     ├── tester.py            # Process B — MTProto probe + observations
-    └── scorer.py            # Process C — deterministic ProxyScore snapshots
+    ├── scorer.py            # Process C — deterministic ProxyScore snapshots
+    └── api.py               # Process D — uvicorn ranking HTTP (not a tick loop)
 
 alembic/                     # async migrations; no DSN in alembic.ini
 scripts/dev_pg.py            # local PostgreSQL without Docker (pgserver, ad hoc)
 infra/docker/                # optional compose file, for people who run Docker
-tests/                       # 749 unit tests; no network, no database
-tests/integration/           # 189 tests against a real PostgreSQL 16
+tests/                       # 782 unit tests; no network, no database
+tests/integration/           # 195 tests against a real PostgreSQL 16
 spike/                       # protocol engine evaluation + its audit
 docs/DATABASE.md             # schema, identity, secrets, claiming, indexes
 docs/DISCOVERY.md            # parsing, normalization, SSRF, persistence
 docs/TESTER.md               # three-phase probe, help.getConfig, Fake-TLS limit
 docs/SCORING.md              # v1 formula, confidence, recency, limitations
 docs/RANKING.md              # serving contract, eligibility, freshness, order
+docs/API.md                  # HTTP transport, health/ready, secret-free errors
 docs/DECISION_LOG.md         # every constraining decision, with evidence
 ```
 
@@ -102,10 +107,10 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 716 passed, 177 skipped (no database)
+uv run pytest                  # 782 passed, 195 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # files already formatted
-uv run mypy .                  # Success: no issues found in 63 source files
+uv run mypy .                  # Success: no issues found in 76 source files
 ```
 
 To also run the 189 integration tests, provision a local PostgreSQL — Docker is
@@ -114,7 +119,7 @@ To also run the 189 integration tests, provision a local PostgreSQL — Docker i
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 938 passed
+                               # 977 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any
@@ -148,12 +153,13 @@ and how they are now reproduced on Linux so CI catches them.
 
 ### Run the workers
 
-Each is a separate process. Start them in three terminals:
+Each is a separate process. Start them in four terminals:
 
 ```bash
 uv run mtproto-discovery
 uv run mtproto-tester
 uv run mtproto-scorer
+uv run mtproto-api            # 127.0.0.1:8080 — GET /healthz /readyz /v1/proxies
 ```
 
 or as modules: `uv run python -m workers.tester`.
