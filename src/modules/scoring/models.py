@@ -7,12 +7,12 @@ from persisted ``ProxyObservation`` rows and emits a :class:`ScoreBreakdown`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from core.models import SCORING_VERSION_V1, utcnow
+from core.models import SCORING_VERSION_V1
 
 __all__ = [
     "ObservationInput",
@@ -82,10 +82,12 @@ class ScoreBreakdown:
     observation_count: int
     successful_count: int
     weighted_success_rate: float
+    #: Reference time the snapshot was computed against. Required so a
+    #: ScoreBreakdown cannot silently stamp the wall clock.
+    calculated_at: datetime
     failure_counts: tuple[tuple[str, int], ...] = ()
     status: ScoreStatus = ScoreStatus.SCORED
     scoring_version: str = SCORING_VERSION_V1
-    calculated_at: datetime = field(default_factory=utcnow)
 
     def __repr__(self) -> str:
         return (

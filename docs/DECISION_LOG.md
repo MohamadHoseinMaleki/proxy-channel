@@ -1065,6 +1065,20 @@ Constants live in code, not env, so two workers cannot silently fork v1. Only `S
 
 ---
 
+### D-039 · Task 005 audit: keep v1 formula; pin as-of time; document concurrency
+
+**Context.** Adversarial audit of `8dc15ec`. The brief asked whether Laplace + `n/(n+10)` is too conservative (1/1 cannot outrank 100/100) and whether `mtproto_connect_ms` should have the Telethon ~2 s floor subtracted.
+
+**Decision — formula unchanged.** Conservatism is intentional (D-038): one GetConfig success is not a proven proxy. Confidence is sample-size only, so `1/1` and `0/1` share `1/11` while reliability still separates them. Subtracting ~2000 ms from latency, or swapping in `tcp_connect_ms`, would fabricate a network figure the tester did not store. `mtproto_connect_ms` remains Phase-3 wall time (client construction + `connect()` + GetConfig), not TCP RTT.
+
+**Decision — `ScoreBreakdown.calculated_at` is required.** The dataclass had `default_factory=utcnow`, which would silently stamp the wall clock if a caller omitted it. The calculator already injects `now`; the default was a footgun, not a feature.
+
+**Decision — no UNIQUE on score generations.** Duplicate snapshots of one `(proxy, last_test_finished_at)` generation are prevented by `FOR UPDATE SKIP LOCKED` plus the claim predicate, matching D-022 (append-only, no unique `proxy_id`). Scorer does not write tester scheduling columns.
+
+**Consequences.** Recency weights (0.5 @ 6 h, 0.25 @ 12 h, 0.0625 @ 24 h) and the confidence matrix are pinned in unit tests. Docs name `now` as the as-of timestamp. No schema change.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |

@@ -36,8 +36,8 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 #: Observations older than this are ignored. Matches the 24h snapshot window
-#: already stored on ``proxy_scores``. With a 6h half-life, weight at 24h is
-#: exp(-4) ≈ 0.018, so cutting here discards almost nothing that still matters.
+#: already stored on ``proxy_scores``. With a 6h true half-life (ln(2)), weight
+#: at 24h is 0.0625, so cutting here discards almost nothing that still matters.
 LOOKBACK_HOURS: Final = 24.0
 
 WINDOW_1H: Final = 1.0
@@ -87,8 +87,9 @@ def score_observations(
 ) -> ScoreBreakdown:
     """Compute a v1 score snapshot from persisted observations.
 
-    ``now`` is injected so tests (and two workers in the same tick) can pin
-    the clock. It must be timezone-aware.
+    ``now`` is the as-of reference timestamp. The calculator never reads the
+    wall clock; the service obtains ``utcnow()`` once per batch and passes it
+    here. It must be timezone-aware.
     """
     if now.tzinfo is None:
         msg = "now must be timezone-aware; use core.models.utcnow()"

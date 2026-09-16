@@ -49,6 +49,14 @@ Per observation, only:
 `tcp_connect_ms` and `total_latency_ms` are ignored for the score. TCP is not
 API verification. `total_latency_ms` includes DNS + TCP + Telethon overhead.
 
+`mtproto_connect_ms` is Phase-3 **wall time** from Telethon client construction
+through `client.connect()` and unauthenticated `help.getConfig` (D-036 / D-037).
+It is **not** TCP RTT. It includes Telethon's ~2 s structural floor plus the
+GetConfig RPC. Scoring uses that stored value as-is.
+
+The calculator never reads the wall clock. Callers pass `now` as the as-of
+reference (the service stamps `utcnow()` once per batch).
+
 ## Formula (`scoring_version = v1`)
 
 Lookback: last **24 hours**. Older rows are dropped.
@@ -105,18 +113,22 @@ confidence_factor = n / (n + 10)
 confidence_score  = 100 * confidence_factor
 ```
 
-`n` is the number of observations in the 24 h window. `N0 = 10` is "about ten
-hourly successes (or a couple of hours of 15-minute failure retries) to reach
-50% confidence."
+`n` is the number of observations in the 24 h window. Confidence is a function
+of **sample size only**, not of the success rate. `1/1` and `0/1` therefore
+share the same `confidence_factor`; their scores still differ via reliability
+(and latency). `N0 = 10` is "about ten hourly successes (or a couple of hours
+of 15-minute failure retries) to reach 50% confidence."
 
-| History | confidence_factor |
-|---|---|
-| 0 observations | 0 |
-| 1/1 | 1/11 ≈ 0.09 |
-| 10/10 | 0.50 |
-| 100/100 | 100/110 ≈ 0.91 |
+| History | n | confidence_factor |
+|---|---|---|
+| 0 observations | 0 | 0 |
+| 1/1 or 0/1 | 1 | 1/11 ≈ 0.09 |
+| 10/10 | 10 | 0.50 |
+| 50/50 or 100/100 | 100 | 100/110 ≈ 0.91 |
+| 100 successes + 1 failure | 101 | 101/111 ≈ 0.91 |
 
-So `1/1` cannot outrank `100/100`.
+So `1/1` cannot outrank `100/100`. This shrinkage is **intentionally
+conservative**: a single GetConfig success is not treated as a proven proxy.
 
 ### Final score
 
@@ -176,14 +188,24 @@ transport can actually verify it.
 ## Persistence
 
 Each run inserts a new `proxy_scores` row (D-022). Historical snapshots stay.
-"Latest score" is `ORDER BY calculated_at DESC LIMIT 1`, served by
+There is no `UPDATE` of existing score rows. "Latest score" is
+`ORDER BY calculated_at DESC LIMIT 1`, served by
 `ix_proxy_scores_proxy_id_calculated_at`.
 
 A proxy is due when it is active, `last_test_finished_at` is set, and no v1
 score has `calculated_at >= last_test_finished_at`. Claiming uses
 `SELECT … FOR UPDATE SKIP LOCKED` on `proxies`. There is **no** score lease
-column: scoring has no network I/O, so the row lock is held only for the short
-read-compute-insert transaction. `test_lock_until` is not reused.
+column and **no** UNIQUE constraint on `(proxy_id, last_test_finished_at)`:
+duplicate concurrent snapshots of the same generation are prevented by the
+row lock (two workers cannot score the same proxy at once) plus the claim
+predicate after commit (the inserted snapshot has `calculated_at >= last_test_finished_at`).
+A crash rolls back; another worker can take the row immediately. After the
+tester writes a newer `last_test_finished_at`, a **new** snapshot is appended.
+
+Scoring is not a second tester scheduler. It never writes `next_test_at`,
+`test_lock_until`, `last_test_*`, or observations. The brief `FOR UPDATE` on
+`proxies` may make the tester `SKIP LOCKED` those rows for milliseconds; that
+is contention, not a change to test cadence.
 
 ## Worked examples (illustrative, not live measurements)
 

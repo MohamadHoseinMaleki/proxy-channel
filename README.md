@@ -110,7 +110,7 @@ To also run the 177 integration tests, provision a local PostgreSQL — Docker i
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 893 passed
+                               # 900 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any

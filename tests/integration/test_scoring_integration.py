@@ -250,6 +250,54 @@ async def test_indexes_serve_latest_score_lookup(db: Database) -> None:
 
 
 @pytest.mark.asyncio
+async def test_scoring_does_not_reschedule_or_lock_the_proxy(db: Database) -> None:
+    proxy = await _seed_tested_proxy(db, server="198.51.100.50", successes=4)
+    async with db.session_scope() as session:
+        row = (await session.execute(select(Proxy).where(Proxy.id == proxy.id))).scalar_one()
+        next_before = row.next_test_at
+        lock_before = row.test_lock_until
+        last_before = row.last_test_finished_at
+        attempts_before = row.test_attempts
+
+    await ScoringService(db, batch_size=10).run_batch()
+
+    async with db.session_scope() as session:
+        row = (await session.execute(select(Proxy).where(Proxy.id == proxy.id))).scalar_one()
+        assert row.next_test_at == next_before
+        assert row.test_lock_until == lock_before
+        assert row.last_test_finished_at == last_before
+        assert row.test_attempts == attempts_before
+        obs_count = (
+            await session.execute(select(func.count()).select_from(ProxyObservation))
+        ).scalar_one()
+        assert obs_count == 4
+
+
+@pytest.mark.asyncio
+async def test_empty_window_inserts_zero_and_is_not_reclaimed(db: Database) -> None:
+    now = utcnow()
+    async with db.session_scope() as session:
+        proxy = make_proxy(server="198.51.100.51", port=443, secret="dd" + "22" * 16)
+        proxy.last_test_finished_at = now
+        session.add(proxy)
+        await session.flush()
+        session.add(_observation(proxy.id, success=True, hours_ago=25.0, now=now))
+
+    service = ScoringService(db, batch_size=10)
+    first = await service.run_batch()
+    assert len(first) == 1
+    assert first[0].score == Decimal("0.000")
+    assert first[0].observation_count == 0
+    second = await service.run_batch()
+    assert second == []
+    async with db.session_scope() as session:
+        scores = (await session.execute(select(ProxyScore))).scalars().all()
+        assert len(scores) == 1
+        obs = (await session.execute(select(ProxyObservation))).scalars().all()
+        assert len(obs) == 1
+
+
+@pytest.mark.asyncio
 async def test_scorer_worker_tick_persists_and_does_not_rescore_until_new_test(
     db: Database,
 ) -> None:

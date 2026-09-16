@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import math
 import pathlib
+from dataclasses import MISSING, fields
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -22,7 +23,7 @@ from modules.scoring.calculator import (
     RELIABILITY_WEIGHT,
     score_observations,
 )
-from modules.scoring.models import ObservationInput, ScoreStatus
+from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreStatus
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 SCORING_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "modules" / "scoring"
@@ -87,6 +88,19 @@ class TestPurity:
                     names.add(node.module.split(".")[0])
             found = forbidden & names
             assert not found, f"{path.name} imports {sorted(found)}"
+
+    def test_calculator_does_not_read_the_wall_clock(self) -> None:
+        tree = ast.parse((SCORING_SRC / "calculator.py").read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "utcnow":
+                pytest.fail("calculator must not call utcnow")
+            if isinstance(node, ast.Attribute) and node.attr in {"now", "utcnow"}:
+                pytest.fail("calculator must not call datetime.now / utcnow")
+
+    def test_score_breakdown_requires_calculated_at(self) -> None:
+        field = next(item for item in fields(ScoreBreakdown) if item.name == "calculated_at")
+        assert field.default is MISSING
+        assert field.default_factory is MISSING
 
 
 class TestEmptyData:
@@ -154,6 +168,28 @@ class TestOneSuccessProblem:
         assert result.sample_count_1h == 1
         assert result.score < Decimal("20.000")
 
+    def test_one_success_and_one_failure_share_confidence(self) -> None:
+        one_ok = score_observations(1, _n_success(1), now=NOW)
+        one_fail = score_observations(2, _n_failure(1), now=NOW)
+        assert one_ok.confidence_factor == pytest.approx(1 / (1 + CONFIDENCE_PRIOR_N))
+        assert one_fail.confidence_factor == one_ok.confidence_factor
+        assert one_ok.score > one_fail.score
+
+    def test_fifty_fifty_matches_one_hundred_confidence_but_not_score(self) -> None:
+        mixed = score_observations(1, _n_success(50) + _n_failure(50, hours_ago=0.5), now=NOW)
+        perfect = score_observations(2, _n_success(100), now=NOW)
+        assert mixed.confidence_factor == pytest.approx(100 / (100 + CONFIDENCE_PRIOR_N))
+        assert perfect.confidence_factor == mixed.confidence_factor
+        assert mixed.score < perfect.score
+
+    def test_one_hundred_plus_one_outranks_the_inverse(self) -> None:
+        mostly_ok = score_observations(1, _n_success(100) + _n_failure(1, hours_ago=0.5), now=NOW)
+        mostly_dead = score_observations(2, _n_success(1) + _n_failure(100, hours_ago=0.5), now=NOW)
+        expected = 101 / (101 + CONFIDENCE_PRIOR_N)
+        assert mostly_ok.confidence_factor == pytest.approx(expected)
+        assert mostly_dead.confidence_factor == pytest.approx(expected)
+        assert mostly_ok.score > mostly_dead.score
+
 
 class TestRecency:
     def test_recent_failures_hurt_more_than_old_failures(self) -> None:
@@ -164,14 +200,25 @@ class TestRecency:
         assert better.score > worse.score
         assert better.weighted_success_rate > worse.weighted_success_rate
 
-    def test_half_life_matches_the_constant(self) -> None:
-        at_half = math.exp(-math.log(2.0) * RECENCY_HALF_LIFE_HOURS / RECENCY_HALF_LIFE_HOURS)
-        assert at_half == pytest.approx(0.5)
-        aged = _obs(RECENCY_HALF_LIFE_HOURS, success=True, mtproto=2100.0)
-        fresh = _obs(0.0, success=True, mtproto=2100.0)
-        # Same success, older sample must pull weighted rate equally only when
-        # mixed with a failure at age 0 — covered in test_recent_failures_hurt_more.
-        assert aged.observed_at < fresh.observed_at
+    def test_half_life_weights_are_applied_by_the_calculator(self) -> None:
+        # One success at age H plus one failure at age 0:
+        # weighted_success_rate = w(H) / (w(H) + 1), with true half-life 6 h.
+        expected = {
+            0.0: 1.0 / 2.0,
+            RECENCY_HALF_LIFE_HOURS: 0.5 / 1.5,
+            12.0: 0.25 / 1.25,
+            LOOKBACK_HOURS: 0.0625 / 1.0625,
+        }
+        assert math.exp(-math.log(2.0) * 6.0 / 6.0) == pytest.approx(0.5)
+        assert math.exp(-math.log(2.0) * 12.0 / 6.0) == pytest.approx(0.25)
+        assert math.exp(-math.log(2.0) * 24.0 / 6.0) == pytest.approx(0.0625)
+        for hours, rate in expected.items():
+            items = [
+                _obs(hours, success=True, mtproto=2100.0),
+                _obs(0.0, success=False, category=ErrorCategory.MT_PROTO_TIMEOUT),
+            ]
+            result = score_observations(1, items, now=NOW)
+            assert result.weighted_success_rate == pytest.approx(rate), hours
 
 
 class TestLatency:
@@ -205,8 +252,10 @@ class TestLatency:
         assert result.latency_score == Decimal("100.000")
 
     def test_latency_at_or_above_worst_bound_is_zero(self) -> None:
-        result = score_observations(1, _n_success(10, mtproto=LATENCY_WORST_MS + 500.0), now=NOW)
-        assert result.latency_score == Decimal("0.000")
+        above = score_observations(1, _n_success(10, mtproto=LATENCY_WORST_MS + 500.0), now=NOW)
+        exact = score_observations(2, _n_success(10, mtproto=LATENCY_WORST_MS), now=NOW)
+        assert above.latency_score == Decimal("0.000")
+        assert exact.latency_score == Decimal("0.000")
 
     def test_tcp_connect_ms_is_not_used_for_latency_score(self) -> None:
         only_tcp = [_obs(0.1, success=True, mtproto=None, tcp=5.0) for _ in range(8)]
@@ -247,12 +296,7 @@ class TestDeterminismAndOrder:
         items = _n_success(4) + _n_failure(3)
         first = score_observations(9, items, now=NOW)
         second = score_observations(9, items, now=NOW)
-        assert first.score == second.score
-        assert first.reliability_score == second.reliability_score
-        assert first.latency_score == second.latency_score
-        assert first.confidence_score == second.confidence_score
-        assert first.failure_counts == second.failure_counts
-        assert first.latency_p50_ms == second.latency_p50_ms
+        assert first == second
 
     def test_input_order_does_not_change_the_score(self) -> None:
         items = (

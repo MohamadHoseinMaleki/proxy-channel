@@ -6,9 +6,13 @@ Architectural invariants:
 3. There is no network I/O. Computation is pure (:func:`score_observations`).
 4. Concurrent workers partition work with ``FOR UPDATE SKIP LOCKED`` on
    ``proxies``. No second lock table, no Redis, and ``test_lock_until`` is
-   not reused (that lease belongs to the tester).
+   not reused (that lease belongs to the tester). Duplicate snapshots of
+   the same generation are prevented by the row lock plus the claim
+   predicate, not by a UNIQUE constraint (D-022).
 5. The row lock is held only for the short read-compute-insert transaction.
    A crash rolls back and another worker can take the row immediately.
+   Scoring never writes ``next_test_at``, ``test_lock_until``, or
+   observations — it is not a second tester scheduler.
 6. Logs carry ``proxy_id`` only — never secrets, DSNs, or ``tg://`` URLs.
 """
 
