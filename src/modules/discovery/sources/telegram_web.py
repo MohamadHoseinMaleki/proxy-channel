@@ -6,7 +6,9 @@ requiring Telegram user credentials, API IDs, phone numbers, or sessions.
 
 from __future__ import annotations
 
-from core.logger import get_logger
+import re
+
+from core.logger import get_logger, safe_error_message
 from core.models import SourceType
 from modules.discovery.http import SsrfSafeHttpClient
 from modules.discovery.models import DiscoveredProxyCandidate
@@ -17,6 +19,9 @@ __all__ = ["TelegramWebSource"]
 
 _logger = get_logger("modules.discovery.sources.telegram_web")
 
+# Public Telegram usernames: 5-32 characters, start with a letter.
+_CHANNEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+
 
 class TelegramWebSource(BaseSource):
     """Scrapes candidate proxies from public Telegram channel web previews (t.me/s/...)."""
@@ -25,6 +30,15 @@ class TelegramWebSource(BaseSource):
         clean_name = channel_name.strip().lstrip("@")
         if not clean_name:
             msg = "Telegram channel name must not be empty"
+            raise ValueError(msg)
+        if (
+            not _CHANNEL_RE.fullmatch(clean_name)
+            or ".." in clean_name
+            or "/" in clean_name
+            or "\\" in clean_name
+            or ":" in clean_name
+        ):
+            msg = "Invalid Telegram channel identifier"
             raise ValueError(msg)
 
         self.source_name = f"@{clean_name}"
@@ -46,8 +60,7 @@ class TelegramWebSource(BaseSource):
             _logger.error(
                 "telegram_web_fetch_failed",
                 channel=self.source_name,
-                url=self.source_url,
-                error=str(exc),
+                error=safe_error_message(exc),
             )
             return []
 

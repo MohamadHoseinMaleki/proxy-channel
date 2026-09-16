@@ -8,6 +8,28 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 008 — Production discovery worker
+
+### D-042 · Wire `mtproto-discovery`; always-upsert; pin DNS; do not reset tester schedule
+
+**Context.** Task 003 shipped parsing, SSRF-on-hop, fingerprinting, and append-only provenance, but `workers.discovery` remained a Task 001 placeholder (`implemented=False`). `persist_candidate` did SELECT-then-INSERT, so a concurrent miss could report `is_new=True` on the conflict path. HTTP built a new `httpx.AsyncClient` per hop, left `HTTPStatusError` unwrapped, and had a DNS-rebinding window between `validate_ssrf_url` and connect. There were no `DISCOVERY_*` settings.
+
+**Decision.**
+
+1. **Worker.** Same lifecycle as tester/scorer: `Database.from_settings`, unreachable DB warns and returns, fetch **outside** any transaction, persist, `implemented=True`, dispose client + engine. Empty `DISCOVERY_SOURCES` is an honest zero-counter tick, not fake work.
+2. **Catalog.** `DISCOVERY_SOURCES` is semicolon-separated `telegram:<channel>` / `http:<url>` (default empty). Telegram channel names are identifiers (`[A-Za-z][A-Za-z0-9_]{4,31}`); path / `../` injection into `https://t.me/s/{channel}` is rejected. Invalid entries are skipped per source.
+3. **Upsert.** Single `INSERT … ON CONFLICT (fingerprint) DO UPDATE` of `last_seen_at` and `is_active=True` only. `is_new` is `RETURNING (xmax = 0)`. Tester columns (`next_test_at`, `test_lock_*`, `last_test_*`, `test_attempts`) are never written on conflict. Naive datetimes raise.
+4. **HTTP.** One worker-owned `SsrfSafeHttpClient`, `aclose` in `finally`. Status/timeout/transport errors wrap as `HttpFetchError` via `safe_error_message`. Resolved public IPs are pinned with a `ContextVar` + `getaddrinfo` wrapper for the request. Mixed public+private DNS is rejected. SSRF is not weakened; loopback is not allowlisted.
+5. **Isolation.** Bounded `DISCOVERY_CONCURRENCY` (default 3). One raising source is logged and counted; the tick continues. `CancelledError` propagates.
+6. **Tests.** No public Telegram and no `127.0.0.1` HTTP fixture (SSRF would block it). Smoke is `RawTextSource` or `httpx.MockTransport`.
+7. **Out of scope.** Scoring v1, ranking SQL, Redis, schema migration (none required).
+
+**Evidence.** Unit tests cover catalog injection, SSRF redirects, status wrap, size, timeout, log redaction, cancel, harvest isolation, empty-source honesty. Integration tests cover concurrent upsert `is_new`, rediscovery vs tester schedule, naive timestamps, and RawText harvest.
+
+**Consequences.** D-011 placeholder honesty no longer applies to discovery. D-035's upsert intent is the conflict path; the SELECT-then-INSERT implementation is gone. D-023 (`next_test_at` default now) still applies on **insert**; rediscovery must not make a recently tested proxy immediately due again.
+
+---
+
 ## Task 007 — Read-only ranking HTTP transport
 
 ### D-041 · FastAPI + Uvicorn as a **separate** ranking adapter; D-016/D-040 HTTP ban is superseded for this process only

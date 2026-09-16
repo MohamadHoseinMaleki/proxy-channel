@@ -1,13 +1,11 @@
-"""Tests for the three worker process entrypoints (Task 001 placeholders).
+"""Tests for the three worker process entrypoints.
 
 What is asserted here:
 
 * each worker module exposes ``WORKER_NAME``, ``tick`` and ``main``;
 * the three processes are genuinely independent (no cross-imports, no shared
   runtime object);
-* the placeholders are honest -- they log ``implemented=False`` rather than
-  pretending to do work;
-* the placeholders perform no network or database I/O;
+* implemented workers warn and return when PostgreSQL is unreachable;
 * the declared console scripts match the modules.
 """
 
@@ -27,35 +25,12 @@ from core.lifecycle import WorkerLifecycle, run_worker
 from .conftest import make_settings
 
 WORKER_MODULES = ("workers.discovery", "workers.tester", "workers.scorer")
-PLACEHOLDER_WORKERS = ("workers.discovery",)
 
 EXPECTED_WORKER_NAMES = {
     "workers.discovery": "discovery-worker",
     "workers.tester": "tester-worker",
     "workers.scorer": "scoring-worker",
 }
-
-EXPECTED_TICK_EVENTS = {
-    "workers.discovery": "discovery_tick",
-    "workers.tester": "tester_tick",
-    "workers.scorer": "scorer_tick",
-}
-
-#: Modules that must not appear in a Task 001 placeholder worker.
-FORBIDDEN_IMPORTS = frozenset(
-    {
-        "telethon",
-        "pyrogram",
-        "sqlalchemy",
-        "asyncpg",
-        "alembic",
-        "socket",
-        "httpx",
-        "aiohttp",
-        "requests",
-        "urllib3",
-    }
-)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -117,11 +92,6 @@ class TestProcessIndependence:
         """Importing one worker must never drag in another process's code."""
         assert "workers" not in module_imports(load(name))
 
-    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
-    def test_worker_has_no_runtime_dependencies_yet(self, name: str) -> None:
-        found = FORBIDDEN_IMPORTS & module_imports(load(name))
-        assert not found, f"{name} imports {sorted(found)}; Task 001 workers must stay inert"
-
     @pytest.mark.parametrize("name", WORKER_MODULES)
     def test_workers_share_no_mutable_state(self, name: str) -> None:
         """Two lifecycles for the same worker must not share counters."""
@@ -133,60 +103,12 @@ class TestProcessIndependence:
         assert second.tick_count == 0
 
 
-class TestPlaceholderHonesty:
-    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
-    async def test_tick_reports_itself_as_unimplemented(
-        self, name: str, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
-    ) -> None:
-        """A placeholder must advertise itself; it must not look like real work."""
-        module = load(name)
-        # Exercise the real composition: context binding happens on __aenter__.
-        async with WorkerLifecycle(module.WORKER_NAME, settings=fast_settings) as life:
-            await module.tick(life)
-
-        records = [
-            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
-        ]
-        # `worker_signals_installed` (DEBUG) legitimately precedes the tick.
-        tick_records = [r for r in records if r["event"] == EXPECTED_TICK_EVENTS[name]]
-        assert len(tick_records) == 1, records
-        record = tick_records[0]
-        assert record["implemented"] is False
-        assert record["worker"] == module.WORKER_NAME
-        assert record["run_id"] == life.run_id
-        assert "timestamp" in record
-        assert record["duration_ms"] >= 0
-
+class TestTickContract:
     @pytest.mark.parametrize("name", WORKER_MODULES)
     async def test_tick_works_outside_the_lifecycle_context(
         self, name: str, fast_settings: Settings
     ) -> None:
         """A bare tick must not depend on bound contextvars or installed handlers."""
-        module = load(name)
-        life = WorkerLifecycle(module.WORKER_NAME, settings=fast_settings)
-        await module.tick(life)
-        assert life.failure_count == 0
-
-    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
-    def test_source_documents_the_pending_task(self, name: str) -> None:
-        source = pathlib.Path(load(name).__file__).read_text(encoding="utf-8")
-        assert "placeholder" in source.lower()
-        assert "TODO" in source
-
-    @pytest.mark.parametrize("name", PLACEHOLDER_WORKERS)
-    async def test_tick_performs_no_io(
-        self, name: str, fast_settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Sabotage the network stack; the placeholder tick must still succeed."""
-        import socket
-
-        def refuse(*_args: Any, **_kwargs: Any) -> None:
-            msg = "worker tick attempted network I/O"
-            raise AssertionError(msg)
-
-        monkeypatch.setattr(socket, "socket", refuse)
-        monkeypatch.setattr(socket, "create_connection", refuse)
-
         module = load(name)
         life = WorkerLifecycle(module.WORKER_NAME, settings=fast_settings)
         await module.tick(life)
@@ -208,6 +130,94 @@ class TestWorkerRunIntegration:
 
         assert await run_worker(module.WORKER_NAME, tick, settings=fast_settings, interval=0.0) == 0
         assert ticks == 2
+
+
+class TestDiscoveryWorker:
+    async def test_discovery_worker_tick_when_db_unreachable(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        """When database is unreachable, discovery warns and exits cleanly."""
+        import workers.discovery as discovery_module
+
+        async with WorkerLifecycle(discovery_module.WORKER_NAME, settings=fast_settings) as life:
+            await discovery_module.tick(life)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        warn_records = [r for r in records if r["event"] == "discovery_tick_db_unreachable"]
+        assert len(warn_records) == 1
+        assert warn_records[0]["worker"] == "discovery-worker"
+        assert life.failure_count == 0
+
+    async def test_empty_sources_is_an_honest_tick_not_fake_work(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import workers.discovery as discovery_module
+
+        fake_db = AsyncMock()
+        fake_db.is_reachable = AsyncMock(return_value=True)
+        fake_db.dispose = AsyncMock()
+
+        async with WorkerLifecycle(discovery_module.WORKER_NAME, settings=fast_settings) as life:
+            with patch("workers.discovery.Database.from_settings", return_value=fake_db):
+                await discovery_module.tick(life, db=fake_db)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        ticks = [r for r in records if r["event"] == "discovery_tick"]
+        assert len(ticks) == 1
+        record = ticks[0]
+        assert record["implemented"] is True
+        assert record["sources_processed"] == 0
+        assert record["proxies_found"] == 0
+        assert record["new_proxies"] == 0
+
+    async def test_invalid_source_is_skipped_not_fatal(
+        self, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import workers.discovery as discovery_module
+
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            discovery_sources="telegram:../etc; telegram:ProxyList",
+        )
+        fake_db = AsyncMock()
+        fake_db.is_reachable = AsyncMock(return_value=True)
+        fake_db.dispose = AsyncMock()
+
+        harvest = AsyncMock()
+        harvest.return_value.sources_attempted = 1
+        harvest.return_value.source_failures = 0
+        harvest.return_value.total_candidates = 0
+        harvest.return_value.new_proxies = 0
+        harvest.return_value.updated_proxies = 0
+        harvest.return_value.discoveries_recorded = 0
+
+        async with WorkerLifecycle(discovery_module.WORKER_NAME, settings=settings) as life:
+            with (
+                patch("workers.discovery.Database.from_settings", return_value=fake_db),
+                patch("workers.discovery.DiscoveryService.harvest", harvest),
+            ):
+                await discovery_module.tick(life, db=fake_db)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        invalid = [r for r in records if r["event"] == "discovery_source_invalid"]
+        assert len(invalid) == 1
+        harvest.assert_awaited_once()
+        assert harvest.await_args is not None
+        called = harvest.await_args.args
+        sources = called[1] if len(called) > 1 else called[0]
+        assert len(sources) == 1
+        assert sources[0].source_name == "@ProxyList"
 
 
 class TestTesterWorker:

@@ -157,9 +157,66 @@ class TestDiscoveryPersistence:
 
         proxy_ids = {r[0] for r in results}
         assert len(proxy_ids) == 1  # Exactly one unique proxy ID allocated
+        assert sum(1 for _proxy_id, is_new in results if is_new) == 1
 
         async with db.session_scope() as session:
             proxies_count = await session.scalar(select(func.count()).select_from(Proxy))
             assert proxies_count == 1
             disc_count = await session.scalar(select(func.count()).select_from(ProxyDiscovery))
             assert disc_count == 5
+
+    async def test_rediscovery_does_not_reset_tester_schedule(self, db: Database) -> None:
+        candidate = _make_candidate()
+        t0 = datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC)
+        t1 = t0 + timedelta(hours=6)
+        scheduled = t0 + timedelta(hours=1)
+
+        async with db.session_scope() as session:
+            proxy_id, is_new = await persist_candidate(session, candidate, now=t0)
+            assert is_new is True
+            proxy = await session.get(Proxy, proxy_id)
+            assert proxy is not None
+            proxy.next_test_at = scheduled
+            proxy.test_attempts = 4
+            proxy.last_test_finished_at = t0
+            proxy.test_lock_until = t0 + timedelta(minutes=2)
+
+        async with db.session_scope() as session:
+            proxy_id2, is_new2 = await persist_candidate(session, candidate, now=t1)
+            assert is_new2 is False
+            assert proxy_id2 == proxy_id
+            proxy = await session.get(Proxy, proxy_id2)
+            assert proxy is not None
+            assert proxy.next_test_at == scheduled
+            assert proxy.test_attempts == 4
+            assert proxy.last_test_finished_at == t0
+            assert proxy.test_lock_until == t0 + timedelta(minutes=2)
+            assert proxy.last_seen_at == t1
+            assert proxy.is_active is True
+
+    async def test_rejects_naive_timestamp(self, db: Database) -> None:
+        candidate = _make_candidate()
+        naive = datetime(2026, 9, 16, 10, 0, 0)
+        async with db.session_scope() as session:
+            with pytest.raises(ValueError, match="timezone-aware"):
+                await persist_candidate(session, candidate, now=naive)
+
+    async def test_harvest_from_raw_text_fixture(self, db: Database) -> None:
+        """Local smoke: in-memory text, no public Telegram and no loopback HTTP."""
+        from modules.discovery.http import SsrfSafeHttpClient
+        from modules.discovery.service import DiscoveryService
+        from modules.discovery.sources.raw_http import RawTextSource
+
+        text = (
+            "tg://proxy?server=1.2.3.4&port=443&secret=000102030405060708090a0b0c0d0e0f\n"
+            "https://t.me/proxy?server=1.2.3.4&port=443&secret=000102030405060708090a0b0c0d0e0f\n"
+        )
+        source = RawTextSource(text, source_name="fixture_list")
+        result = await DiscoveryService(db).harvest(
+            [source], http_client=SsrfSafeHttpClient(), concurrency=1
+        )
+        assert result.sources_attempted == 1
+        assert result.source_failures == 0
+        assert result.total_candidates == 1
+        assert result.new_proxies == 1
+        assert result.discoveries_recorded == 1

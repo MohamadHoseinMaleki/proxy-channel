@@ -1,7 +1,7 @@
-# MTProto Proxy Discovery & Parsing (Task 003)
+# MTProto Proxy Discovery & Parsing (Tasks 003 / 008)
 
 This document describes the discovery, parsing, normalisation, validation, SSRF protection,
-and persistence layer implemented in Task 003.
+persistence, and **discovery worker** implemented in Tasks 003 and 008.
 
 ---
 
@@ -103,10 +103,14 @@ SHA-256("v1" + 0x1f + protocol + 0x1f + normalized_server + 0x1f + port + 0x1f +
 
 Implemented in `src/modules/discovery/http.py`:
 * **`SsrfSafeHttpClient`**:
-  - Finite connect and read timeouts (default 15s).
+  - Finite connect and read timeouts (default 15s / 5s connect).
   - Bounded response bodies (default max 2 MiB) via chunked stream reading.
-  - Controlled redirect handling: max 3 redirects.
-  - **Every redirect hop** validates destination scheme (`http`/`https`) and resolves DNS to verify that the target IP does not resolve to loopback, private, link-local, multicast, or cloud metadata ranges.
+  - Controlled redirect handling: max 3 redirects. `follow_redirects` is never enabled; hops are followed in process so each `Location` is SSRF-checked.
+  - **Every redirect hop** validates destination scheme (`http`/`https`) and resolves DNS to verify that the target IP does not resolve to loopback, private, link-local, multicast, mapped, or cloud metadata ranges.
+  - Mixed public+private DNS answers are rejected (Happy Eyeballs must not pick the private record).
+  - Resolved public IPs are **pinned** for the duration of the request (`ContextVar` + `getaddrinfo` wrapper) so a rebinding hostname cannot connect to a later private answer.
+  - HTTP status errors, timeouts, and transport errors are wrapped as `HttpFetchError` with `safe_error_message` (no raw URL / secret in the exception).
+  - The worker owns one client and `aclose()`s it in `finally`.
 
 ---
 

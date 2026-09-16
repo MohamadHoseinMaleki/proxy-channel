@@ -61,6 +61,11 @@ class TestTelegramWebSource:
         with pytest.raises(ValueError, match="channel name must not be empty"):
             TelegramWebSource("   ")
 
+    @pytest.mark.parametrize("bad", ["../etc", "foo/bar", "s/admin", "ab"])
+    def test_rejects_path_injection(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="Invalid Telegram channel"):
+            TelegramWebSource(bad)
+
 
 class TestRawHttpSource:
     async def test_fetches_and_extracts_from_url(self) -> None:

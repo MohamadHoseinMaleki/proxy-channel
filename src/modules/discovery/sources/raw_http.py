@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.logger import get_logger
+from core.logger import get_logger, safe_error_message, scrub_secrets
 from core.models import SourceType
 from modules.discovery.http import SsrfSafeHttpClient
 from modules.discovery.models import DiscoveredProxyCandidate
@@ -27,7 +27,12 @@ class RawHttpSource(BaseSource):
         http_client: SsrfSafeHttpClient | None = None,
     ) -> list[DiscoveredProxyCandidate]:
         client = http_client or SsrfSafeHttpClient()
-        _logger.info("raw_http_fetch_started", source_name=self.source_name, url=self.source_url)
+        source_url = self.source_url or ""
+        _logger.info(
+            "raw_http_fetch_started",
+            source_name=self.source_name,
+            url=scrub_secrets(source_url),
+        )
 
         try:
             assert self.source_url is not None
@@ -36,8 +41,7 @@ class RawHttpSource(BaseSource):
             _logger.error(
                 "raw_http_fetch_failed",
                 source_name=self.source_name,
-                url=self.source_url,
-                error=str(exc),
+                error=safe_error_message(exc),
             )
             return []
 

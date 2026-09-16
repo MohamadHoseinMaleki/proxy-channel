@@ -4,23 +4,28 @@ Uses PostgreSQL to guarantee:
 1. No race conditions between concurrent discovery processes.
 2. 10,000 sightings of the same proxy resolve to one canonical ``Proxy`` row.
 3. Every sighting creates an append-only ``ProxyDiscovery`` provenance record.
-4. Existing test results, error categories, and observations are NEVER overwritten.
+4. Existing tester scheduling, observations, and scores are NEVER overwritten.
+5. HTTP/source I/O never runs inside a database transaction.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import literal_column
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import Database
-from core.logger import get_logger
+from core.logger import get_logger, safe_error_message
 from core.models import Proxy, ProxyDiscovery, utcnow
+from modules.discovery.http import SsrfSafeHttpClient
 from modules.discovery.models import DiscoveredProxyCandidate
+from modules.discovery.sources.base import BaseSource
 
 __all__ = [
     "DiscoveryBatchResult",
@@ -40,6 +45,15 @@ class DiscoveryBatchResult:
     new_proxies: int
     updated_proxies: int
     discoveries_recorded: int
+    sources_attempted: int = 0
+    source_failures: int = 0
+
+
+def _require_aware(value: datetime, name: str) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        msg = f"{name} must be timezone-aware; use core.models.utcnow()"
+        raise ValueError(msg)
+    return value
 
 
 async def persist_candidate(
@@ -50,55 +64,46 @@ async def persist_candidate(
 ) -> tuple[int, bool]:
     """Atomically upsert a single candidate and record its discovery event.
 
+    Always uses ``INSERT … ON CONFLICT (fingerprint) DO UPDATE``. ``is_new``
+    is taken from PostgreSQL ``xmax = 0`` (inserted in this command), not from
+    a prior SELECT. Concurrent workers therefore cannot both report a first
+    sighting.
+
+    Conflict updates only ``last_seen_at`` and ``is_active``. Tester columns
+    (``next_test_at``, ``test_lock_*``, ``last_test_*``, ``test_attempts``)
+    are left alone.
+
     Returns:
         (proxy_id, is_new)
     """
-    timestamp = now or utcnow()
+    timestamp = _require_aware(now or utcnow(), "now")
 
-    # Check if proxy already exists by its deterministic fingerprint
-    existing_id = await session.scalar(
-        select(Proxy.id).where(Proxy.fingerprint == candidate.proxy.fingerprint)
+    proxy_upsert: Any = (
+        pg_insert(Proxy)
+        .values(
+            protocol=candidate.proxy.protocol,
+            server=candidate.proxy.server,
+            port=candidate.proxy.port,
+            secret=candidate.proxy.secret,
+            fingerprint=candidate.proxy.fingerprint,
+            is_active=True,
+            first_seen_at=timestamp,
+            last_seen_at=timestamp,
+            next_test_at=timestamp,
+        )
+        .on_conflict_do_update(
+            index_elements=[Proxy.fingerprint],
+            set_={
+                "last_seen_at": timestamp,
+                "is_active": True,
+            },
+        )
+        .returning(Proxy.id, literal_column("(xmax = 0)").label("inserted"))
     )
+    row = (await session.execute(proxy_upsert)).one()
+    proxy_id = int(row[0])
+    is_new = bool(row[1])
 
-    if existing_id is not None:
-        proxy_id = existing_id
-        is_new = False
-        await session.execute(
-            update(Proxy)
-            .where(Proxy.id == proxy_id)
-            .values(
-                last_seen_at=timestamp,
-                is_active=True,
-            )
-        )
-    else:
-        # Insert with on_conflict_do_update to guard against concurrent workers
-        proxy_upsert = (
-            pg_insert(Proxy)
-            .values(
-                protocol=candidate.proxy.protocol,
-                server=candidate.proxy.server,
-                port=candidate.proxy.port,
-                secret=candidate.proxy.secret,
-                fingerprint=candidate.proxy.fingerprint,
-                is_active=True,
-                first_seen_at=timestamp,
-                last_seen_at=timestamp,
-                next_test_at=timestamp,
-            )
-            .on_conflict_do_update(
-                index_elements=[Proxy.fingerprint],
-                set_={
-                    "last_seen_at": timestamp,
-                    "is_active": True,
-                },
-            )
-            .returning(Proxy.id)
-        )
-        proxy_id = (await session.execute(proxy_upsert)).scalar_one()
-        is_new = True
-
-    # Append-only provenance recording into `proxy_discoveries`
     discovery_insert = pg_insert(ProxyDiscovery).values(
         proxy_id=proxy_id,
         source_type=str(candidate.source_type),
@@ -119,7 +124,7 @@ async def persist_candidates(
     now: datetime | None = None,
 ) -> DiscoveryBatchResult:
     """Persist a sequence of discovered candidates within an existing session scope."""
-    timestamp = now or utcnow()
+    timestamp = _require_aware(now or utcnow(), "now")
     new_count = 0
     updated_count = 0
     discoveries_count = 0
@@ -163,3 +168,64 @@ class DiscoveryService:
                 discoveries=result.discoveries_recorded,
             )
             return result
+
+    async def harvest(
+        self,
+        sources: Sequence[BaseSource],
+        *,
+        http_client: SsrfSafeHttpClient,
+        now: datetime | None = None,
+        concurrency: int = 1,
+    ) -> DiscoveryBatchResult:
+        """Fetch every source *outside* a transaction, then persist.
+
+        One failing source is logged and skipped; it does not abort the tick.
+        ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` propagate.
+        """
+        limit = max(1, concurrency)
+        semaphore = asyncio.Semaphore(limit)
+
+        async def _fetch(source: BaseSource) -> list[DiscoveredProxyCandidate]:
+            async with semaphore:
+                return await source.fetch_candidates(http_client)
+
+        gathered = await asyncio.gather(
+            *(_fetch(source) for source in sources),
+            return_exceptions=True,
+        )
+
+        candidates: list[DiscoveredProxyCandidate] = []
+        failures = 0
+        for source, item in zip(sources, gathered, strict=True):
+            if isinstance(item, BaseException) and not isinstance(item, Exception):
+                raise item
+            if isinstance(item, Exception):
+                failures += 1
+                _logger.error(
+                    "discovery_source_failed",
+                    source_name=source.source_name,
+                    source_type=str(source.source_type),
+                    error=safe_error_message(item),
+                )
+                continue
+            candidates.extend(item)
+
+        if not candidates:
+            return DiscoveryBatchResult(
+                total_candidates=0,
+                new_proxies=0,
+                updated_proxies=0,
+                discoveries_recorded=0,
+                sources_attempted=len(sources),
+                source_failures=failures,
+            )
+
+        persisted = await self.save_candidates(candidates, now=now)
+        return DiscoveryBatchResult(
+            total_candidates=persisted.total_candidates,
+            new_proxies=persisted.new_proxies,
+            updated_proxies=persisted.updated_proxies,
+            discoveries_recorded=persisted.discoveries_recorded,
+            sources_attempted=len(sources),
+            source_failures=failures,
+        )

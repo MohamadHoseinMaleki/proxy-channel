@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from modules.discovery.catalog import (
+    DiscoverySourceSpecError,
+    parse_discovery_sources,
+    validate_http_source_url,
+    validate_telegram_channel,
+)
 from modules.discovery.http import (
     HttpFetchError,
     ResponseSizeExceededError,
@@ -47,6 +53,7 @@ __all__ = [
     "DiscoveredProxyCandidate",
     "DiscoveryBatchResult",
     "DiscoveryService",
+    "DiscoverySourceSpecError",
     "DiscoveryValidationError",
     "HttpFetchError",
     "MTProtoProxy",
@@ -62,6 +69,7 @@ __all__ = [
     "SsrfSafeHttpClient",
     "TelegramWebSource",
     "extract_proxy_urls",
+    "parse_discovery_sources",
     "parse_proxy_text",
     "parse_proxy_url",
     "persist_candidate",
@@ -70,4 +78,6 @@ __all__ = [
     "validate_and_normalize_server",
     "validate_and_parse_secret",
     "validate_hostname",
+    "validate_http_source_url",
+    "validate_telegram_channel",
 ]

@@ -15,13 +15,13 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–007 complete
+## ⚠️ Current status: Tasks 001–008 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
-API** are implemented. The discovery worker is still a placeholder
-(`implemented=False`). The tester and scorer workers do real work against
-PostgreSQL. HTTP is an adapter over `RankingService.list_top` (D-041);
-it does not rediscover, retest, or rescore.
+API** are implemented. All three tick workers do real work against PostgreSQL
+when configured. HTTP is an adapter over `RankingService.list_top` (D-041);
+it does not rediscover, retest, or rescore. Discovery sources default to
+empty (`DISCOVERY_SOURCES=`) so an unconfigured worker ticks honestly.
 
 **No live public proxy was measured in this environment.** Unit and integration
 scores are computed from persisted (often synthetic) observations. See
@@ -38,7 +38,8 @@ scores are computed from persisted (often synthetic) observations. See
 | 005 | Deterministic scoring engine + scorer worker | ✅ **complete** |
 | 006 | Ranking & serving layer over latest `ProxyScore` | ✅ **complete** |
 | 007 | Read-only ranking HTTP transport (FastAPI + Uvicorn) | ✅ **complete** |
-| 008–009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
+| 008 | Production discovery worker, upsert, SSRF/HTTP hardening | ✅ **complete** |
+| 009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
 | 010–012 | Reporting, Telegram publishing, AI content | ⬜ not started |
 | 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
@@ -77,7 +78,7 @@ src/
 │   ├── ranking/             # latest-score ranking, secret-safe listings
 │   └── api/                 # FastAPI adapter over RankingService
 └── workers/
-    ├── discovery.py         # Process A — placeholder
+    ├── discovery.py         # Process A — source fetch + upsert (D-042)
     ├── tester.py            # Process B — MTProto probe + observations
     ├── scorer.py            # Process C — deterministic ProxyScore snapshots
     └── api.py               # Process D — uvicorn ranking HTTP (not a tick loop)
@@ -107,10 +108,10 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 782 passed, 195 skipped (no database)
+uv run pytest                  # 817 passed, 198 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # files already formatted
-uv run mypy .                  # Success: no issues found in 76 source files
+uv run mypy .                  # Success: no issues found in 82 source files
 ```
 
 To also run the 189 integration tests, provision a local PostgreSQL — Docker is
@@ -119,7 +120,7 @@ To also run the 189 integration tests, provision a local PostgreSQL — Docker i
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 977 passed
+                               # 1015 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any
@@ -210,9 +211,13 @@ case-insensitive and a `.env` file is read automatically.
 | `HEARTBEAT_INTERVAL_SECONDS` | `60` | `0` disables heartbeats |
 | `WORKER_POLL_INTERVAL_SECONDS` | `5` | idle delay between ticks |
 | `WORKER_ERROR_BACKOFF_SECONDS`, `WORKER_MAX_ERROR_BACKOFF_SECONDS` | `2`, `60` | exponential, capped |
+| `DISCOVERY_SOURCES` | *(empty)* | `telegram:<channel>;http:<url>`; invalid entries skipped |
+| `DISCOVERY_TIMEOUT_SECONDS`, `DISCOVERY_CONNECT_TIMEOUT_SECONDS` | `15`, `5` | per-request HTTP bounds |
+| `DISCOVERY_MAX_RESPONSE_BYTES`, `DISCOVERY_MAX_REDIRECTS` | `2 MiB`, `3` | body / redirect caps |
+| `DISCOVERY_CONCURRENCY` | `3` | bounded source fetches per tick |
 
-Tester timeouts, scoring interval, Telegram and Qwen credentials are **not**
-defined yet — they arrive with Tasks 005, 009, 011 and 013.
+Telegram publisher and Qwen credentials are **not** defined yet — they arrive
+with later reporting tasks.
 
 ### Secrets
 

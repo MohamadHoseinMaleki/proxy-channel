@@ -149,6 +149,16 @@ class Settings(BaseSettings):
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8080, ge=1, le=65535)
 
+    # --- Discovery (Task 008) ----------------------------------------------
+    #: Semicolon-separated ``telegram:<channel>`` / ``http:<url>`` entries.
+    #: Default empty: the worker ticks honestly and fetches nothing.
+    discovery_sources: str = Field(default="")
+    discovery_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    discovery_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    discovery_max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=16 * 1024 * 1024)
+    discovery_max_redirects: int = Field(default=3, ge=0, le=10)
+    discovery_concurrency: int = Field(default=3, ge=1, le=20)
+
     # --- Validation --------------------------------------------------------
 
     @field_validator("log_level", "third_party_log_level", mode="before")

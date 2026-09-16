@@ -420,3 +420,27 @@ class TestApiBind:
     def test_rejects_out_of_range_port(self, port: int) -> None:
         with pytest.raises(ValidationError):
             make_settings(api_port=port)
+
+
+class TestDiscoverySettings:
+    def test_defaults_are_idle_and_bounded(self) -> None:
+        settings = make_settings()
+        assert settings.discovery_sources == ""
+        assert settings.discovery_timeout_seconds == 15.0
+        assert settings.discovery_connect_timeout_seconds == 5.0
+        assert settings.discovery_max_response_bytes == 2 * 1024 * 1024
+        assert settings.discovery_max_redirects == 3
+        assert settings.discovery_concurrency == 3
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DISCOVERY_SOURCES", "telegram:ProxyList")
+        monkeypatch.setenv("DISCOVERY_TIMEOUT_SECONDS", "9")
+        monkeypatch.setenv("DISCOVERY_CONCURRENCY", "2")
+        settings = build_settings(env_file=None)
+        assert settings.discovery_sources == "telegram:ProxyList"
+        assert settings.discovery_timeout_seconds == 9.0
+        assert settings.discovery_concurrency == 2
+
+    def test_rejects_non_positive_timeout(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(discovery_timeout_seconds=0)
