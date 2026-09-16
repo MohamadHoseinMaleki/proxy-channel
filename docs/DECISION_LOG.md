@@ -1079,6 +1079,26 @@ Constants live in code, not env, so two workers cannot silently fork v1. Only `S
 
 ---
 
+### D-040 · Ranking is a read-only first page over latest v1 scores; no HTTP framework
+
+**Context.** Task 006 needs a deterministic serving contract on append-only `ProxyScore` snapshots. D-016 forbids FastAPI/Redis. D-022 already indexed "latest score per proxy" as `ix_proxy_scores_proxy_id_calculated_at`.
+
+**Decision — no web framework.** `RankingService.list_top` is the serving API. A later publisher (Task 010) can wrap it. Introducing FastAPI here would reverse D-016 for no consumer.
+
+**Decision — latest = max `(calculated_at, id)` among `scoring_version = v1`.** PostgreSQL `DISTINCT ON (proxy_id) ORDER BY proxy_id, calculated_at DESC, id DESC`. One listing per proxy. An unserviceable latest row (stale, empty window) does **not** fall back to an older snapshot.
+
+**Decision — eligibility is not a second health score.** Active + v1 + `sample_count_24h > 0` + `calculated_at >= as_of - 24h`. Failed-only histories remain eligible and rank at the bottom via the Task 005 score. 24 h matches v1 lookback (D-038): a snapshot older than its own window is not current enough to serve. Constant in code, not env. `as_of` is injected.
+
+**Decision — order.** `score DESC, calculated_at DESC, proxy_id ASC`. No random, no hash, no wall clock in the sort.
+
+**Decision — pagination.** Default 20, max 100, reject otherwise. No OFFSET. No keyset cursor yet: there is no public transport and no extra HMAC secret in the stack. SQL `LIMIT` after the latest/eligibility filters.
+
+**Decision — no migration.** The existing composite index serves DISTINCT ON. Listings omit secret, fingerprint, and URLs; `secret_type` is `legacy`/`dd`/`ee`/`unknown`.
+
+**Consequences.** Ranking never writes proxies, observations, or scores. Tests pin latest-snapshot selection, ties, freshness boundaries, and secret absence in `repr`/JSON/logs.
+
+---
+
 ## Deferred to their own tasks
 
 | Item | Task |
