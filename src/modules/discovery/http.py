@@ -6,8 +6,8 @@ Protects against:
 * Multicast, unspecified, and reserved IP addresses.
 * Internal DNS hostnames and metadata endpoints.
 * Unsafe redirect chains (every hop is validated against SSRF rules).
-* DNS rebinding between resolve and connect (resolved public IPs are pinned
-  for the duration of the request via a context-local getaddrinfo wrapper).
+* DNS rebinding between resolve and connect (the request is rewritten to the
+  validated IP literal; a task-local getaddrinfo pin is defence in depth).
 * Unbounded response bodies (streaming with max byte limits).
 * Slow loris / hung connections (strict connect/read timeouts).
 """
@@ -78,6 +78,46 @@ def _hostname_key(host: str) -> str:
     return host
 
 
+def _gai_host_key(host: object) -> str | None:
+    """Normalise a getaddrinfo host (str, bytes, or bracketed) to a pin key.
+
+    httpx/anyio encode the hostname to ASCII/IDNA **bytes** before calling
+    ``loop.getaddrinfo`` → ``socket.getaddrinfo``. A str-only pin map would
+    miss that lookup and fall through to a fresh unpinned resolve.
+    """
+    if isinstance(host, bytes):
+        try:
+            host = host.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(host, str):
+        return None
+    return _hostname_key(host)
+
+
+def _synthetic_addrinfo(
+    ips: tuple[str, ...],
+    port: Any,
+    family: int,
+    socktype: int,
+    proto: int,
+) -> list[Any]:
+    port_num = int(port) if port else 0
+    results: list[Any] = []
+    for ip_str in ips:
+        ip_obj = ipaddress.ip_address(ip_str)
+        if ip_obj.version == 6:
+            sockaddr: tuple[Any, ...] = (ip_str, port_num, 0, 0)
+            af = socket.AF_INET6
+        else:
+            sockaddr = (ip_str, port_num)
+            af = socket.AF_INET
+        if family not in (0, socket.AF_UNSPEC, af):
+            continue
+        results.append((af, socktype or socket.SOCK_STREAM, proto or 6, "", sockaddr))
+    return results
+
+
 def _pinned_getaddrinfo(
     host: str,
     port: Any,
@@ -87,26 +127,36 @@ def _pinned_getaddrinfo(
     flags: int = 0,
 ) -> list[Any]:
     pinned = _PINNED_HOSTS.get()
-    key = _hostname_key(host) if isinstance(host, str) else host
-    if pinned is not None and isinstance(key, str) and key in pinned:
-        port_num = int(port) if port else 0
-        results: list[Any] = []
-        for ip_str in pinned[key]:
-            ip_obj = ipaddress.ip_address(ip_str)
-            if ip_obj.version == 6:
-                sockaddr: tuple[Any, ...] = (ip_str, port_num, 0, 0)
-                af = socket.AF_INET6
-            else:
-                sockaddr = (ip_str, port_num)
-                af = socket.AF_INET
-            if family not in (0, socket.AF_UNSPEC, af):
-                continue
-            results.append((af, type or socket.SOCK_STREAM, proto or 6, "", sockaddr))
+    key = _gai_host_key(host)
+    if pinned is not None and key is not None and key in pinned:
+        results = _synthetic_addrinfo(pinned[key], port, family, type, proto)
         if not results:
             msg = f"Pinned DNS produced no addresses for {key}"
             raise socket.gaierror(socket.EAI_NONAME, msg)
         return results
     return _REAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+def _url_with_pinned_ip(url: str, ip: str) -> str:
+    """Rewrite *url* so the transport connects to ``ip`` without a second DNS lookup."""
+    parsed = urllib.parse.urlsplit(url)
+    host = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def _host_header(parsed: urllib.parse.SplitResult) -> str:
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return ""
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.port and parsed.port != default_port:
+        if ":" in hostname:
+            return f"[{hostname}]:{parsed.port}"
+        return f"{hostname}:{parsed.port}"
+    return hostname
 
 
 def _ensure_getaddrinfo_patch() -> None:
@@ -250,6 +300,9 @@ class SsrfSafeHttpClient:
         kwargs: dict[str, Any] = {
             "timeout": self._timeout(),
             "follow_redirects": False,
+            # IP-rewritten origins would otherwise share a keep-alive socket
+            # across different original hostnames (wrong Host/SNI on reuse).
+            "limits": httpx.Limits(max_keepalive_connections=0, max_connections=20),
         }
         if self._transport is not None:
             kwargs["transport"] = self._transport
@@ -288,13 +341,25 @@ class SsrfSafeHttpClient:
                 pinned_ips = await validate_ssrf_url(current_url)
                 parsed = urllib.parse.urlsplit(current_url)
                 hostname = parsed.hostname or ""
+                pinned_ip = pinned_ips[0]
                 pin = {hostname: pinned_ips, _hostname_key(hostname): pinned_ips}
                 if ":" in hostname:
                     pin[f"[{hostname}]"] = pinned_ips
+                request_url = _url_with_pinned_ip(current_url, pinned_ip)
+                headers = self._headers()
+                host_header = _host_header(parsed)
+                if host_header and _hostname_key(hostname) != pinned_ip:
+                    headers["Host"] = host_header
+                extensions: dict[str, Any] = {}
+                if parsed.scheme == "https" and hostname and hostname != pinned_ip:
+                    extensions["sni_hostname"] = hostname
                 with _pin_hosts(pin):
                     try:
                         async with client.stream(
-                            "GET", current_url, headers=self._headers()
+                            "GET",
+                            request_url,
+                            headers=headers,
+                            extensions=extensions,
                         ) as response:
                             if response.status_code in _REDIRECT_STATUSES:
                                 location = response.headers.get("Location")

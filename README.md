@@ -108,19 +108,19 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 817 passed, 198 skipped (no database)
+uv run pytest                  # 825 passed, 198 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # files already formatted
 uv run mypy .                  # Success: no issues found in 82 source files
 ```
 
-To also run the 189 integration tests, provision a local PostgreSQL — Docker is
+To also run the 198 integration tests, provision a local PostgreSQL — Docker is
 **not** required:
 
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 1015 passed
+                               # 1023 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any

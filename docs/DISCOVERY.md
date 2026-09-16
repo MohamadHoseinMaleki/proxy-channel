@@ -108,7 +108,7 @@ Implemented in `src/modules/discovery/http.py`:
   - Controlled redirect handling: max 3 redirects. `follow_redirects` is never enabled; hops are followed in process so each `Location` is SSRF-checked.
   - **Every redirect hop** validates destination scheme (`http`/`https`) and resolves DNS to verify that the target IP does not resolve to loopback, private, link-local, multicast, mapped, or cloud metadata ranges.
   - Mixed public+private DNS answers are rejected (Happy Eyeballs must not pick the private record).
-  - Resolved public IPs are **pinned** for the duration of the request (`ContextVar` + `getaddrinfo` wrapper) so a rebinding hostname cannot connect to a later private answer.
+  - Resolved public IPs are **pinned** for the duration of the request: the request URL is rewritten to the validated IP literal (original `Host` / SNI preserved) so the transport cannot perform a second, unpinned lookup. A task-local `ContextVar` + `getaddrinfo` wrapper is defence in depth (including bytes hostnames used by anyio/httpx). Keep-alive is disabled so IP-origin sockets cannot mix SNI across hostnames.
   - HTTP status errors, timeouts, and transport errors are wrapped as `HttpFetchError` with `safe_error_message` (no raw URL / secret in the exception).
   - The worker owns one client and `aclose()`s it in `finally`.
 

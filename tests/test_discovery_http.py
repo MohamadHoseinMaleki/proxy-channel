@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -217,3 +218,133 @@ class TestSsrfSafeHttpClient:
             results = socket.getaddrinfo("rebind.example", 443)
         assert results
         assert results[0][4][0] == "8.8.8.8"
+
+    def test_bytes_hostname_uses_the_same_pin(self) -> None:
+        """anyio/httpx pass IDNA bytes into getaddrinfo; the pin must still hit."""
+        _ensure_getaddrinfo_patch()
+        with _pin_hosts({"rebind.example": ("1.1.1.1",)}):
+            results = socket.getaddrinfo(b"rebind.example", 443)
+        assert results[0][4][0] == "1.1.1.1"
+
+    def test_hook_is_installed_once(self) -> None:
+        _ensure_getaddrinfo_patch()
+        first = socket.getaddrinfo
+        SsrfSafeHttpClient()
+        SsrfSafeHttpClient()
+        assert socket.getaddrinfo is first
+
+    def test_unpinned_lookup_uses_real_getaddrinfo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import modules.discovery.http as http_module
+
+        _ensure_getaddrinfo_patch()
+        seen: list[object] = []
+
+        def fake_real(host: object, *_args: Any, **_kwargs: Any) -> list[Any]:
+            seen.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("9.9.9.9", 0))]
+
+        monkeypatch.setattr(http_module, "_REAL_GETADDRINFO", fake_real)
+        socket.getaddrinfo("unpinned.example", 80)
+        assert seen == ["unpinned.example"]
+
+    async def test_concurrent_pins_never_cross(self) -> None:
+        _ensure_getaddrinfo_patch()
+        barrier = asyncio.Barrier(2)
+
+        async def one(ip: str) -> tuple[str, str]:
+            with _pin_hosts({"shared.example": (ip,)}):
+                await barrier.wait()
+                as_str = socket.getaddrinfo("shared.example", 443)[0][4][0]
+                await asyncio.sleep(0)
+                as_bytes = socket.getaddrinfo(b"shared.example", 443)[0][4][0]
+                return str(as_str), str(as_bytes)
+
+        a, b = await asyncio.gather(one("1.1.1.1"), one("8.8.8.8"))
+        assert a == ("1.1.1.1", "1.1.1.1")
+        assert b == ("8.8.8.8", "8.8.8.8")
+
+    async def test_pin_reset_after_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import modules.discovery.http as http_module
+
+        _ensure_getaddrinfo_patch()
+        seen: list[str] = []
+
+        def fake_real(host: object, *_args: Any, **_kwargs: Any) -> list[Any]:
+            seen.append(str(host))
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("9.9.9.9", 0))]
+
+        monkeypatch.setattr(http_module, "_REAL_GETADDRINFO", fake_real)
+        with pytest.raises(RuntimeError, match="boom"), _pin_hosts({"x.example": ("1.1.1.1",)}):
+            assert socket.getaddrinfo("x.example", 443)[0][4][0] == "1.1.1.1"
+            raise RuntimeError("boom")
+        socket.getaddrinfo("x.example", 443)
+        assert seen == ["x.example"]
+
+    async def test_pin_reset_after_cancellation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import modules.discovery.http as http_module
+
+        _ensure_getaddrinfo_patch()
+        started = asyncio.Event()
+        seen: list[str] = []
+
+        def fake_real(host: object, *_args: Any, **_kwargs: Any) -> list[Any]:
+            seen.append(str(host))
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("9.9.9.9", 0))]
+
+        monkeypatch.setattr(http_module, "_REAL_GETADDRINFO", fake_real)
+
+        async def hold() -> None:
+            with _pin_hosts({"x.example": ("1.1.1.1",)}):
+                started.set()
+                await asyncio.sleep(30)
+
+        task = asyncio.create_task(hold())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        socket.getaddrinfo("x.example", 443)
+        assert seen == ["x.example"]
+
+    async def test_request_is_sent_to_pinned_ip_not_hostname(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import modules.discovery.http as http_module
+
+        async def fake_validate(_url: str) -> tuple[str, ...]:
+            return ("8.8.8.8",)
+
+        monkeypatch.setattr(http_module, "validate_ssrf_url", fake_validate)
+        seen: list[tuple[str | None, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((request.url.host, request.headers.get("host")))
+            return httpx.Response(200, content=b"ok")
+
+        client = SsrfSafeHttpClient(transport=httpx.MockTransport(handler))
+        body = await client.get_text("http://public.example/list")
+        assert body == "ok"
+        assert seen == [("8.8.8.8", "public.example")]
+
+    async def test_redirect_hop_pins_independently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import modules.discovery.http as http_module
+
+        async def fake_validate(url: str) -> tuple[str, ...]:
+            host = urlsplit(url).hostname
+            mapping = {"first.example": "1.1.1.1", "second.example": "8.8.8.8"}
+            assert host in mapping
+            return (mapping[host],)
+
+        monkeypatch.setattr(http_module, "validate_ssrf_url", fake_validate)
+        seen: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.host)
+            if request.url.path == "/start":
+                return httpx.Response(302, headers={"Location": "http://second.example/next"})
+            return httpx.Response(200, content=b"ok")
+
+        client = SsrfSafeHttpClient(transport=httpx.MockTransport(handler))
+        body = await client.get_text("http://first.example/start")
+        assert body == "ok"
+        assert seen == ["1.1.1.1", "8.8.8.8"]
