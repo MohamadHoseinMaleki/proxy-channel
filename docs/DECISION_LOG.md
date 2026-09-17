@@ -8,6 +8,46 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 012 — Proxy reporting and selection
+
+### D-046 · Reporting is stricter than ranking; recent GetConfig success required
+
+**Context.** Ranking (D-040) lists latest v1 scores without secrets and allows
+failed-only histories. Task 012 needs a publisher-facing selection: secrets in
+an internal payload, canonical `tg://proxy` URLs, and a safety rule that a high
+historical score is not enough.
+
+**Decision.**
+
+1. **Separate module.** `modules.reporting` does not change ranking, scoring v1,
+   discovery, or the tester. No worker, no HTTP, no Telegram.
+2. **Latest score.** Same `DISTINCT ON (proxy_id)` v1 snapshot as ranking. No
+   fallback to an older generation.
+3. **Recent success.** The latest observation whose `error_category` is not
+   `CANCELLED` must be `success = true` (GetConfig) and
+   `observed_at >= as_of - 6h`. `CANCELLED` is infra, not a verdict.
+   A later real failure hides an older success. `calculated_at` / discovery
+   time are not this clock.
+4. **Fake-TLS.** Secret type `ee` is never publishable. `UNSUPPORTED_TRANSPORT`
+   cannot satisfy recent success.
+5. **Order.** `score DESC`, last success DESC, `latency_p50_ms` ASC NULLS LAST,
+   `fingerprint` ASC.
+6. **Payload.** JSON includes the plaintext secret (internal only). TXT is one
+   canonical `tg://proxy?...` line, RFC 3986 `quote`. `repr` and logs mask.
+   Unserializable rows are skipped by `proxy_id`.
+7. **Settings.** `REPORT_DEFAULT_LIMIT=20`, `REPORT_MAX_LIMIT=100`,
+   `REPORT_MAX_SUCCESS_AGE_HOURS=6` (capped at 24). Version stays `v1` in code.
+8. **No migration.** Existing indexes serve the query.
+
+**Evidence.** Unit tests pin eligibility, ties, Fake-TLS exclusion, JSON/TXT
+round-trip through `parse_proxy_url`. Integration tests persist mixed histories
+and assert order plus no mutation.
+
+**Consequences.** Ranking listings and reporting selections can diverge on
+purpose. A future publisher consumes `Report`; it is not implemented here.
+
+---
+
 ## Task 011 — Production scoring engine
 
 ### D-045 · Keep v1 formula and schema; isolate per-proxy compute; derive freshness in process

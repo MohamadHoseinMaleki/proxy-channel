@@ -403,6 +403,31 @@ class TestScorerBatchSize:
             make_settings(scorer_batch_size=0)
 
 
+class TestReportingSettings:
+    def test_defaults(self) -> None:
+        settings = make_settings()
+        assert settings.report_default_limit == 20
+        assert settings.report_max_limit == 100
+        assert settings.report_max_success_age_hours == 6.0
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("REPORT_DEFAULT_LIMIT", "5")
+        monkeypatch.setenv("REPORT_MAX_LIMIT", "10")
+        monkeypatch.setenv("REPORT_MAX_SUCCESS_AGE_HOURS", "3")
+        settings = build_settings(env_file=None)
+        assert settings.report_default_limit == 5
+        assert settings.report_max_limit == 10
+        assert settings.report_max_success_age_hours == 3.0
+
+    def test_rejects_inverted_limits(self) -> None:
+        with pytest.raises(ValidationError, match="report_default_limit"):
+            make_settings(report_default_limit=50, report_max_limit=10)
+
+    def test_rejects_age_above_lookback(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(report_max_success_age_hours=25)
+
+
 class TestApiBind:
     def test_defaults_to_loopback_8080(self) -> None:
         settings = make_settings()

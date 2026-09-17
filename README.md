@@ -15,7 +15,7 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–011 complete
+## ⚠️ Current status: Tasks 001–012 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
@@ -45,8 +45,9 @@ scores are computed from persisted (often synthetic) observations. See
 | 009 | Production worker runtime (shutdown, isolation, no overlap) | ✅ **complete** |
 | 010 | Tester timeouts, transport verification, lease-on-cancel | ✅ **complete** |
 | 011 | Production scoring engine (v1 formula, append-only snapshots) | ✅ **complete** |
-| 012 | Reporting, Telegram publishing, AI content | ⬜ not started |
-| 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
+| 012 | Reporting & selection (publishable top-N, JSON/TXT) | ✅ **complete** |
+| 013 | Telegram publishing, AI content | ⬜ not started |
+| 014–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
 ---
 
@@ -81,6 +82,7 @@ src/
 ├── modules/                 # domain logic (populated by Tasks 003–012)
 │   ├── scheduling.py        # FOR UPDATE SKIP LOCKED claim primitive
 │   ├── ranking/             # latest-score ranking, secret-safe listings
+│   ├── reporting/           # publishable selection, JSON/TXT (D-046)
 │   └── api/                 # FastAPI adapter over RankingService
 └── workers/
     ├── discovery.py         # Process A — source fetch + upsert (D-042)
@@ -99,6 +101,7 @@ docs/DISCOVERY.md            # parsing, normalization, SSRF, persistence
 docs/TESTER.md               # three-phase probe, help.getConfig, Fake-TLS limit
 docs/SCORING.md              # v1 formula, confidence, recency, limitations
 docs/RANKING.md              # serving contract, eligibility, freshness, order
+docs/REPORTING.md            # publishable selection, JSON/TXT, recent-success
 docs/API.md                  # HTTP transport, health/ready, secret-free errors
 docs/DECISION_LOG.md         # every constraining decision, with evidence
 ```

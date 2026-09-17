@@ -153,6 +153,15 @@ class Settings(BaseSettings):
     #: fork ``scoring_version=v1``.
     scorer_batch_size: int = Field(default=50, ge=1, le=500)
 
+    # --- Reporting (Task 012) ----------------------------------------------
+    #: Default / maximum size of a publishable selection. Formula and
+    #: scoring_version stay in code; these only bound the page.
+    report_default_limit: int = Field(default=20, ge=1, le=100)
+    report_max_limit: int = Field(default=100, ge=1, le=100)
+    #: How recent a GetConfig success must be. Default 6 h matches scoring
+    #: ``RECENT``. Capped at 24 h (v1 lookback); older success is not current.
+    report_max_success_age_hours: float = Field(default=6.0, gt=0, le=24)
+
     # --- HTTP ranking API (Task 007) ---------------------------------------
     #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.
     api_host: str = Field(default="127.0.0.1")
@@ -213,6 +222,14 @@ class Settings(BaseSettings):
             msg = "worker_max_error_backoff_seconds must be >= worker_error_backoff_seconds"
             raise ValueError(msg)
         return value
+
+    @model_validator(mode="after")
+    def _check_report_limits(self) -> Settings:
+        """Default page size must not exceed the operator-configured cap."""
+        if self.report_default_limit > self.report_max_limit:
+            msg = "report_default_limit must be <= report_max_limit"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _check_production_ready(self) -> Settings:
