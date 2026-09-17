@@ -30,7 +30,13 @@ from types import FrameType
 from typing import Any
 
 from core.config import Settings, get_settings
-from core.logger import bind_worker_context, configure_logging, get_logger, unbind_worker_context
+from core.logger import (
+    bind_worker_context,
+    configure_logging,
+    get_logger,
+    safe_error_message,
+    unbind_worker_context,
+)
 
 __all__ = [
     "Tick",
@@ -96,6 +102,8 @@ class WorkerLifecycle:
         self.tick_count = 0
         self.failure_count = 0
         self.consecutive_failures = 0
+        self._run_active = False
+        self._tick_active = False
 
     # -- introspection ------------------------------------------------------
 
@@ -234,8 +242,28 @@ class WorkerLifecycle:
 
         ``tick`` exceptions are contained: one bad iteration logs
         ``worker_tick_failed`` and backs off instead of terminating the process.
+
+        One ``run()`` at a time per instance. Ticks are strictly sequential:
+        tick N+1 cannot start until tick N's ``finally`` has finished.
         """
-        poll_interval = self.settings.worker_poll_interval_seconds if interval is None else interval
+        if self._run_active:
+            msg = "WorkerLifecycle.run() is not re-entrant; ticks must not overlap"
+            raise RuntimeError(msg)
+
+        if interval is None:
+            poll_interval = self.settings.worker_poll_interval_seconds
+        else:
+            # Direct callers may pass a test interval; never busy-loop on a
+            # negative value. Settings already rejects ``<= 0`` via pydantic.
+            poll_interval = max(0.0, float(interval))
+
+        if tick_timeout is None:
+            configured = self.settings.worker_tick_timeout_seconds
+            tick_timeout = configured if configured > 0 else None
+        elif tick_timeout <= 0:
+            tick_timeout = None
+
+        self._run_active = True
         self.started_at = time.monotonic()
         self._logger.info(
             "worker_started",
@@ -245,31 +273,34 @@ class WorkerLifecycle:
             poll_interval_seconds=poll_interval,
         )
 
-        while not self.shutdown_requested:
-            tick_started = time.monotonic()
-            self.tick_count += 1
-            tick_no = self.tick_count
-            try:
-                if tick_timeout is not None:
-                    await asyncio.wait_for(tick(self), timeout=tick_timeout)
-                else:
-                    await tick(self)
-                self.consecutive_failures = 0
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                # Cooperative cancellation must propagate to asyncio.run().
-                self.request_shutdown("cancelled")
-                raise
-            except TimeoutError:
-                self._record_failure(tick_no, "tick_timeout", TimeoutError(str(tick_timeout)))
-            except Exception as exc:
-                # A worker must survive any single bad tick.
-                self._record_failure(tick_no, "tick_error", exc)
+        try:
+            while not self.shutdown_requested:
+                tick_started = time.monotonic()
+                self.tick_count += 1
+                tick_no = self.tick_count
+                self._logger.debug("worker_tick_started", tick=tick_no, run_id=self.run_id)
+                try:
+                    await self._run_one_tick(tick, tick_timeout)
+                    self.consecutive_failures = 0
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    # Cooperative cancellation must propagate to asyncio.run().
+                    # Do not convert it into a successful tick.
+                    self.request_shutdown("cancelled")
+                    raise
+                except TimeoutError:
+                    self._record_failure(tick_no, "tick_timeout", TimeoutError(str(tick_timeout)))
+                except Exception as exc:
+                    # A worker must survive any single bad tick.
+                    self._record_failure(tick_no, "tick_error", exc)
 
-            self._maybe_heartbeat()
+                self._maybe_heartbeat()
 
-            elapsed = time.monotonic() - tick_started
-            if not await self.sleep(self._next_delay(poll_interval, elapsed)):
-                break
+                elapsed = time.monotonic() - tick_started
+                if not await self.sleep(self._next_delay(poll_interval, elapsed)):
+                    break
+        finally:
+            self._run_active = False
+            self._tick_active = False
 
         self._logger.info(
             "worker_stopped",
@@ -280,6 +311,19 @@ class WorkerLifecycle:
             failures=self.failure_count,
         )
 
+    async def _run_one_tick(self, tick: Tick, tick_timeout: float | None) -> None:
+        if self._tick_active:
+            msg = "overlapping tick in a single worker process"
+            raise RuntimeError(msg)
+        self._tick_active = True
+        try:
+            if tick_timeout is not None:
+                await asyncio.wait_for(tick(self), timeout=tick_timeout)
+            else:
+                await tick(self)
+        finally:
+            self._tick_active = False
+
     def _record_failure(self, tick_no: int, kind: str, exc: BaseException) -> None:
         self.failure_count += 1
         self.consecutive_failures += 1
@@ -287,7 +331,7 @@ class WorkerLifecycle:
             "worker_tick_failed",
             tick=tick_no,
             kind=kind,
-            error=str(exc),
+            error=safe_error_message(exc),
             exception_type=type(exc).__name__,
             consecutive_failures=self.consecutive_failures,
             exc_info=exc,
@@ -365,7 +409,7 @@ async def run_worker(
         # Top-level guard: report, then let systemd/Task Scheduler restart us.
         lifecycle.logger.critical(
             "worker_crashed",
-            error=str(exc),
+            error=safe_error_message(exc),
             exception_type=type(exc).__name__,
             exc_info=exc,
         )

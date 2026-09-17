@@ -122,12 +122,21 @@ class Settings(BaseSettings):
     test_database_url: SecretStr | None = Field(default=None)
 
     # --- Worker lifecycle --------------------------------------------------
+    #: Operator-facing budget for in-flight work after the first stop signal.
+    #: Pair with systemd ``TimeoutStopSec``. The loop itself finishes the current
+    #: tick (or ``worker_tick_timeout_seconds``) then stops; a second signal
+    #: still force-exits. This is not a second cancel path.
     shutdown_grace_seconds: float = Field(default=10.0, ge=0)
     #: ``0`` disables heartbeat logging entirely (used by fast unit tests).
     heartbeat_interval_seconds: float = Field(default=60.0, ge=0)
     worker_poll_interval_seconds: float = Field(default=5.0, gt=0)
     worker_error_backoff_seconds: float = Field(default=2.0, ge=0)
     worker_max_error_backoff_seconds: float = Field(default=60.0, ge=0)
+    #: Hard cap on a single tick. ``0`` disables (the default): hung work is
+    #: still interruptible by a second signal (``os._exit``) and by cooperative
+    #: cancellation. Set this in production if a stuck Telethon handshake
+    #: should not pin the process until the supervisor kills it.
+    worker_tick_timeout_seconds: float = Field(default=0.0, ge=0)
 
     # --- Telegram & Tester (Task 004) --------------------------------------
     telegram_api_id: int | None = Field(default=None)

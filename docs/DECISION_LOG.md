@@ -8,6 +8,27 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 009 — Production worker runtime hardening
+
+### D-043 · Harden the existing `WorkerLifecycle`; do not add a second scheduler
+
+**Context.** Tasks 004–008 already run discovery, tester, and scorer as independent OS processes on `WorkerLifecycle`, with per-tick `Database.from_settings` + `dispose`, `FOR UPDATE SKIP LOCKED` tester leases (`test_lock_until`, no `locked_by` column), MemorySession probes, append-only scores, and DNS-pinned discovery HTTP. Task 009 is operational hardening of that loop, not a rewrite.
+
+**Decision.**
+
+1. **Keep sequential ticks.** One `run()` per lifecycle instance (`_run_active`). One tick at a time (`_tick_active`). Tick N+1 cannot start until tick N's `finally` has finished. Nested `run()` raises `RuntimeError`.
+2. **Cancel and timeout still run tick cleanup.** `CancelledError` / `KeyboardInterrupt` / `SystemExit` re-raise after `request_shutdown("cancelled")`. Optional `WORKER_TICK_TIMEOUT_SECONDS` (default `0` = off) is `asyncio.wait_for` around the tick; timeout is a recoverable `tick_timeout` failure. First SIGTERM/SIGINT still finishes the in-flight tick (or the tick timeout); a second signal is still `os._exit(130)` (D-006). `SHUTDOWN_GRACE_SECONDS` is the operator-facing budget for systemd `TimeoutStopSec`, not a second cancel path.
+3. **Interval.** Settings still reject `WORKER_POLL_INTERVAL_SECONDS <= 0`. Direct `run(interval=…)` callers clamp negatives to `0.0` so a test cannot busy-loop. No jitter (tests forbid unbounded random).
+4. **Secrets.** Tick-failure and crash logs use `safe_error_message`, not `str(exc)`. Redaction still runs after `format_exc_info` (D-008).
+5. **Isolation unchanged.** Per-tick DB ownership, tester lease expiry as crash recovery, API process still off `WorkerLifecycle` (D-041). No Redis/Celery, no schema migration, no `locked_by`.
+6. **Out of scope.** Scoring v1, ranking SQL, discovery SSRF/pin, Task 010 reporting.
+
+**Evidence.** Lifecycle tests cover overlap, re-entrancy, cancel-during-tick `finally`, timeout cleanup, secret-in-tick-log, and settings-wired tick timeout. Worker tests assert `dispose` after a raising tick.
+
+**Consequences.** Operators who need a hung-handshake cap set `WORKER_TICK_TIMEOUT_SECONDS`. Crash recovery remains lease expiry, not a new lock table.
+
+---
+
 ## Task 008 — Production discovery worker
 
 ### D-042 · Wire `mtproto-discovery`; always-upsert; pin DNS; do not reset tester schedule

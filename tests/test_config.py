@@ -158,6 +158,13 @@ class TestValidation:
         with pytest.raises(ValidationError):
             make_settings(worker_poll_interval_seconds=0)
 
+    def test_tick_timeout_defaults_to_disabled(self) -> None:
+        assert make_settings().worker_tick_timeout_seconds == 0.0
+
+    def test_tick_timeout_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(worker_tick_timeout_seconds=-1)
+
     def test_rejects_inverted_backoff_bounds(self) -> None:
         with pytest.raises(ValidationError, match="worker_max_error_backoff_seconds"):
             make_settings(worker_error_backoff_seconds=30, worker_max_error_backoff_seconds=5)

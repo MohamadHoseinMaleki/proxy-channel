@@ -236,6 +236,25 @@ class TestRunLoop:
         assert life._next_delay(1.0, 0.25) == pytest.approx(0.75)
         assert life._next_delay(1.0, 5.0) == 0.0
 
+    async def test_settings_tick_timeout_is_applied(self) -> None:
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            worker_error_backoff_seconds=0.0,
+            worker_max_error_backoff_seconds=0.0,
+            worker_tick_timeout_seconds=0.05,
+        )
+
+        async def tick(life: WorkerLifecycle) -> None:
+            if life.tick_count >= 2:
+                life.request_shutdown("done")
+            await asyncio.sleep(30)
+
+        life = WorkerLifecycle("tester", settings=settings)
+        await life.run(tick, interval=0.0)
+        assert life.failure_count == 2
+        assert life.tick_count == 2
+
     async def test_tick_timeout_is_enforced(self, fast_settings: Settings) -> None:
         """A hung tick must not hang the worker forever."""
 
@@ -273,6 +292,123 @@ class TestRunLoop:
         life = WorkerLifecycle("scorer", settings=fast_settings)
         life._maybe_heartbeat()
         assert life._last_heartbeat is None
+
+    async def test_ticks_never_overlap(self, fast_settings: Settings) -> None:
+        concurrent = 0
+        peak = 0
+
+        async def tick(life: WorkerLifecycle) -> None:
+            nonlocal concurrent, peak
+            concurrent += 1
+            peak = max(peak, concurrent)
+            await asyncio.sleep(0.01)
+            concurrent -= 1
+            if life.tick_count >= 3:
+                life.request_shutdown("enough")
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        await life.run(tick, interval=0.0)
+        assert peak == 1
+        assert concurrent == 0
+
+    async def test_run_is_not_reentrant(self, fast_settings: Settings) -> None:
+        started = asyncio.Event()
+
+        async def tick(life: WorkerLifecycle) -> None:
+            started.set()
+            await asyncio.sleep(0.2)
+            life.request_shutdown("done")
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        runner = asyncio.create_task(life.run(tick, interval=0.0))
+        await started.wait()
+        with pytest.raises(RuntimeError, match="not re-entrant"):
+            await life.run(tick, interval=0.0)
+        life.request_shutdown("done")
+        await runner
+
+    async def test_negative_interval_does_not_busy_loop(self, fast_settings: Settings) -> None:
+        async def tick(life: WorkerLifecycle) -> None:
+            if life.tick_count >= 2:
+                life.request_shutdown("done")
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        await life.run(tick, interval=-1.0)
+        assert life.tick_count == 2
+        assert life.failure_count == 0
+
+    async def test_cancellation_during_tick_runs_cleanup(self, fast_settings: Settings) -> None:
+        cleaned: list[bool] = []
+        started = asyncio.Event()
+
+        async def tick(_: WorkerLifecycle) -> None:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                cleaned.append(True)
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        runner = asyncio.create_task(life.run(tick, interval=0.0))
+        await started.wait()
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+        assert cleaned == [True]
+        assert life.shutdown_reason == "cancelled"
+
+    async def test_tick_timeout_still_runs_tick_cleanup(self, fast_settings: Settings) -> None:
+        cleaned: list[int] = []
+
+        async def tick(life: WorkerLifecycle) -> None:
+            try:
+                if life.tick_count >= 2:
+                    life.request_shutdown("done")
+                    return
+                await asyncio.sleep(30)
+            finally:
+                cleaned.append(life.tick_count)
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        await life.run(tick, interval=0.0, tick_timeout=0.05)
+        assert cleaned
+        assert life.failure_count >= 1
+
+    async def test_tick_exception_cleanup_then_continue(self, fast_settings: Settings) -> None:
+        cleaned: list[str] = []
+
+        async def tick(life: WorkerLifecycle) -> None:
+            try:
+                if life.tick_count == 1:
+                    msg = "boom"
+                    raise RuntimeError(msg)
+                life.request_shutdown("recovered")
+            finally:
+                cleaned.append("finally")
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        await life.run(tick, interval=0.0)
+        assert cleaned == ["finally", "finally"]
+        assert life.failure_count == 1
+        assert life.shutdown_reason == "recovered"
+
+    async def test_failed_tick_does_not_log_proxy_secret(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        secret = "000102030405060708090a0b0c0d0e0f"
+
+        async def tick(life: WorkerLifecycle) -> None:
+            if life.tick_count >= 2:
+                life.request_shutdown("done")
+                return
+            msg = f"connect failed secret={secret}"
+            raise RuntimeError(msg)
+
+        life = WorkerLifecycle("tester", settings=fast_settings)
+        await life.run(tick, interval=0.0)
+        output = json_logs.readouterr().out
+        assert secret not in output
+        assert "***REDACTED***" in output
 
 
 class TestSignalHandling:

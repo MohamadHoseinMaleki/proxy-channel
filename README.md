@@ -15,13 +15,16 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–008 complete
+## ⚠️ Current status: Tasks 001–009 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
 when configured. HTTP is an adapter over `RankingService.list_top` (D-041);
 it does not rediscover, retest, or rescore. Discovery sources default to
 empty (`DISCOVERY_SOURCES=`) so an unconfigured worker ticks honestly.
+Worker processes share one sequential lifecycle: no overlapping ticks,
+secret-safe failure logs, optional tick timeout, and crash recovery via the
+existing tester lease (`test_lock_until`).
 
 **No live public proxy was measured in this environment.** Unit and integration
 scores are computed from persisted (often synthetic) observations. See
@@ -39,7 +42,7 @@ scores are computed from persisted (often synthetic) observations. See
 | 006 | Ranking & serving layer over latest `ProxyScore` | ✅ **complete** |
 | 007 | Read-only ranking HTTP transport (FastAPI + Uvicorn) | ✅ **complete** |
 | 008 | Production discovery worker, upsert, SSRF/HTTP hardening | ✅ **complete** |
-| 009 | Remaining tester/scoring operational work as originally numbered | superseded by 004–005 where overlapping |
+| 009 | Production worker runtime (shutdown, isolation, no overlap) | ✅ **complete** |
 | 010–012 | Reporting, Telegram publishing, AI content | ⬜ not started |
 | 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
@@ -108,7 +111,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 825 passed, 198 skipped (no database)
+uv run pytest                  # 838 passed, 198 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # files already formatted
 uv run mypy .                  # Success: no issues found in 82 source files
@@ -120,7 +123,7 @@ To also run the 198 integration tests, provision a local PostgreSQL — Docker i
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 1023 passed
+                               # 1036 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any

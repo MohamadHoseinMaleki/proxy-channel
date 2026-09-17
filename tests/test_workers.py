@@ -295,6 +295,41 @@ class TestScorerWorker:
         assert ticks == 2
 
 
+class TestWorkerResourceOwnership:
+    @pytest.mark.parametrize(
+        ("module_name", "service_patch"),
+        [
+            ("workers.discovery", "workers.discovery.DiscoveryService.harvest"),
+            ("workers.tester", "workers.tester.TesterService.run_batch"),
+            ("workers.scorer", "workers.scorer.ScoringService.run_batch"),
+        ],
+    )
+    async def test_owned_database_is_disposed_after_tick_exception(
+        self,
+        module_name: str,
+        service_patch: str,
+    ) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            discovery_sources="telegram:ProxyList",
+        )
+        module = load(module_name)
+        fake_db = AsyncMock()
+        fake_db.is_reachable = AsyncMock(return_value=True)
+        fake_db.dispose = AsyncMock()
+        life = WorkerLifecycle(module.WORKER_NAME, settings=settings)
+        with (
+            patch(f"{module_name}.Database.from_settings", return_value=fake_db),
+            patch(service_patch, side_effect=RuntimeError("tick boom")),
+            pytest.raises(RuntimeError, match="tick boom"),
+        ):
+            await module.tick(life)
+        fake_db.dispose.assert_awaited()
+
+
 class TestConsoleScripts:
     def test_pyproject_declares_one_script_per_worker(self) -> None:
         import tomllib
