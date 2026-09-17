@@ -6,12 +6,13 @@ Architectural invariants:
 2. Bounded concurrency: governed by an asyncio.Semaphore to prevent socket exhaustion.
 3. Leases are cleared on test completion so expired locks can self-heal.
 4. Observations are append-only and never deleted or overwritten.
+5. Cancellation and per-proxy timeout persist a failure observation and release
+   ``test_lock_until``. A hard kill still recovers via lease expiry (no ``locked_by``).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
 from datetime import timedelta
 
 from sqlalchemy import update
@@ -19,8 +20,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import Database
-from core.logger import get_logger
-from core.models import DEFAULT_LEASE_SECONDS, Proxy, ProxyObservation, utcnow
+from core.logger import get_logger, safe_error_message
+from core.models import DEFAULT_LEASE_SECONDS, ErrorCategory, Proxy, ProxyObservation, utcnow
 from modules.discovery.normalizer import validate_and_parse_secret
 from modules.scheduling import claim_due_proxies
 from modules.tester.models import TesterResult
@@ -119,8 +120,12 @@ class TesterService:
         )
 
     async def run_batch(self) -> list[TesterResult]:
-        """Claim a batch of due proxies, test them concurrently, and record outcomes."""
-        # Transaction 1: Claim due proxies atomically
+        """Claim a batch of due proxies, test them concurrently, and record outcomes.
+
+        Cancellation of the batch still writes a ``CANCELLED`` observation per
+        unfinished proxy and clears ``test_lock_until``, then re-raises
+        ``CancelledError`` so the worker tick is not counted as success.
+        """
         claimed_proxies: list[Proxy] = []
         async with self.db.session_scope() as session:
             claimed_proxies = await claim_due_proxies(
@@ -134,11 +139,28 @@ class TesterService:
 
         _logger.info("tester_batch_claimed", count=len(claimed_proxies))
 
-        # Network Probing: strictly OUTSIDE database transactions
-        tasks = [self.test_proxy(p) for p in claimed_proxies]
-        results: Sequence[TesterResult] = await asyncio.gather(*tasks, return_exceptions=False)
+        tasks = [
+            asyncio.create_task(self.test_proxy(proxy), name=f"tester-probe-{proxy.id}")
+            for proxy in claimed_proxies
+        ]
+        cancelled = False
+        try:
+            await asyncio.wait(tasks)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait(tasks)
 
-        # Transaction 2: Record observations and update scheduling
+        results = [
+            _result_from_task(proxy, task)
+            for proxy, task in zip(claimed_proxies, tasks, strict=True)
+        ]
+
         async with self.db.session_scope() as session:
             for res in results:
                 await self.record_result(session, res)
@@ -147,5 +169,32 @@ class TesterService:
             "tester_batch_completed",
             total=len(results),
             successes=sum(1 for r in results if r.success),
+            cancelled=cancelled,
         )
-        return list(results)
+
+        if cancelled:
+            raise asyncio.CancelledError
+        return results
+
+
+def _aborted_result(proxy_id: int) -> TesterResult:
+    return TesterResult(
+        proxy_id=proxy_id,
+        success=False,
+        error_category=ErrorCategory.CANCELLED,
+        error_message_safe="Probe cancelled before completion",
+    )
+
+
+def _result_from_task(proxy: Proxy, task: asyncio.Task[TesterResult]) -> TesterResult:
+    if not task.done() or task.cancelled():
+        return _aborted_result(proxy.id)
+    exc = task.exception()
+    if exc is not None:
+        return TesterResult(
+            proxy_id=proxy.id,
+            success=False,
+            error_category=ErrorCategory.UNKNOWN_ERROR,
+            error_message_safe=safe_error_message(exc),
+        )
+    return task.result()

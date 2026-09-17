@@ -8,6 +8,49 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 010 — Tester production hardening and transport verification
+
+### D-044 · Phase-aware probe timeouts; Fake-TLS stays unsupported; cancel releases leases
+
+**Context.** Task 009 left three tester concerns: a hung handshake can pin a
+process unless `WORKER_TICK_TIMEOUT_SECONDS` is set; crash recovery is
+`test_lock_until` expiry; Fake-TLS (`ee`) was classified unsupported from an
+earlier Telethon audit. Task 010 re-audits Telethon **1.45.0** in this
+environment and hardens timeout/cancellation without a schema change.
+
+**Decision.**
+
+1. **Fake-TLS.** `TcpMTProxy.normalize_secret` still truncates to 16 bytes and
+   drops the SNI domain. `MTProxyIO` has no ClientHello/SNI/TLS record. Keep
+   `UNSUPPORTED_TRANSPORT`. Do not downgrade to Randomized Intermediate. Do not
+   open a socket to classify an `ee` secret.
+2. **Legacy / `dd`.** Both use `ConnectionTcpMTProxyRandomizedIntermediate`
+   (`obfuscate_tag = dd dd dd dd`). `0xDD` secrets remain codec-mandatory in
+   `MTProxyIO.init_header`.
+3. **Timeouts.** Per-phase `asyncio.wait_for` capped by the remaining total
+   budget. TCP timeout stays `TCP_TIMEOUT` with `tcp_connect_ms is None`.
+   MTProto/GetConfig timeout stays `MT_PROTO_TIMEOUT` with TCP timing preserved
+   and `mtproto_connect_ms is None`. DNS hang is `DNS_TIMEOUT`. A timeout
+   cancels the awaitable; `disconnect()` still runs in `finally`.
+4. **Verification.** Unauthenticated `help.GetConfigRequest` remains the success
+   criterion. `is_user_authorized()` is not called.
+5. **Leases.** `run_batch` uses explicit tasks. On cancel: uncancel the batch
+   task enough to persist, write `CANCELLED` observations, clear
+   `test_lock_until`, then re-raise `CancelledError`. Hard kill still relies on
+   300 s lease expiry. No `locked_by`, no migration.
+6. **Out of scope.** Scoring v1, ranking SQL, API contracts, live public
+   proxies. No claim that any proxy works.
+
+**Evidence.** Unit tests inspect installed Telethon source, prove timeout stops
+the connect coroutine, and prove a cancelled batch records `CANCELLED`.
+Integration test proves `test_lock_until` is cleared after cancel.
+
+**Consequences.** Operators who need a whole-tick cap still set
+`WORKER_TICK_TIMEOUT_SECONDS`. Fake-TLS candidates are skipped honestly until a
+library that implements the handshake exists.
+
+---
+
 ## Task 009 — Production worker runtime hardening
 
 ### D-043 · Harden the existing `WorkerLifecycle`; do not add a second scheduler

@@ -35,11 +35,28 @@ class TestDirectIpLiterals:
             "::1",
             "fe80::1",
             "fc00::1",
+            "224.0.0.1",  # multicast
+            "::",  # unspecified
+            "::ffff:127.0.0.1",  # IPv4-mapped loopback
+            "::ffff:169.254.169.254",  # IPv4-mapped metadata
+            "::ffff:10.0.0.1",  # IPv4-mapped private
         ],
     )
     async def test_disallowed_ip_literals_are_rejected(self, blocked_ip: str) -> None:
         with pytest.raises(DestinationBlockedError, match="disallowed network range"):
             await resolve_and_validate_destination(blocked_ip, 443)
+
+    @pytest.mark.asyncio
+    async def test_hostname_resolving_to_ipv4_mapped_loopback_is_blocked(self) -> None:
+        fake_addrinfo = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::ffff:127.0.0.1", 443, 0, 0)),
+        ]
+        with patch("asyncio.get_running_loop") as mock_get_loop:
+            mock_loop = AsyncMock()
+            mock_loop.getaddrinfo.return_value = fake_addrinfo
+            mock_get_loop.return_value = mock_loop
+            with pytest.raises(DestinationBlockedError, match="disallowed IP"):
+                await resolve_and_validate_destination("mapped.example.com", 443)
 
 
 class TestHostnameValidationAndDns:

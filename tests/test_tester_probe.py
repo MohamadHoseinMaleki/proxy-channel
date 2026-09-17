@@ -118,18 +118,20 @@ class TestProbeSsrfAndDns:
 class TestProbeTransportCapability:
     @pytest.mark.asyncio
     async def test_fake_tls_secret_returns_unsupported_transport(self) -> None:
-        # Pinned public IP to bypass DNS
-        result = await probe_proxy(
-            proxy_id=3,
-            server="1.1.1.1",
-            port=443,
-            secret="ee" + "aa" * 16 + "7777772e636f6d",
-            secret_type=SecretType.FAKE_TLS,
-        )
+        with patch("asyncio.open_connection") as mock_open:
+            result = await probe_proxy(
+                proxy_id=3,
+                server="1.1.1.1",
+                port=443,
+                secret="ee" + "aa" * 16 + "7777772e636f6d",
+                secret_type=SecretType.FAKE_TLS,
+            )
+        mock_open.assert_not_called()
         assert result.success is False
         assert result.error_category == ErrorCategory.UNSUPPORTED_TRANSPORT
         assert result.transport_type == TransportType.FAKE_TLS
         assert "Fake-TLS" in (result.error_message_safe or "")
+        assert result.tcp_connect_ms is None
 
     @pytest.mark.asyncio
     async def test_invalid_secret_hex_returns_invalid_secret(self) -> None:
@@ -172,6 +174,8 @@ class TestProbeTcpPhase:
             )
             assert result.success is False
             assert result.error_category == ErrorCategory.TCP_TIMEOUT
+            assert result.tcp_connect_ms is None
+            assert result.mtproto_connect_ms is None
 
     @pytest.mark.asyncio
     async def test_tcp_connection_reset(self) -> None:
@@ -291,6 +295,9 @@ class TestProbeTelethonPhase:
         assert isinstance(session_arg, MemorySession)
         assert call_kwargs["auto_reconnect"] is False
         assert call_kwargs["timeout"] == 8.0
+        assert call_kwargs["receive_updates"] is False
+        # Connection is pinned to the validated IP, never the original hostname.
+        assert call_kwargs["proxy"] == ("1.1.1.1", 443, "dd" + "11" * 16)
         mock_client.disconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -311,6 +318,8 @@ class TestProbeTelethonPhase:
 
         assert result.success is False
         assert result.error_category == ErrorCategory.MT_PROTO_TIMEOUT
+        assert result.tcp_connect_ms is not None
+        assert result.mtproto_connect_ms is None
         mock_client.connect.assert_awaited()
         mock_client.disconnect.assert_awaited_once()
 
@@ -371,6 +380,62 @@ class TestProbeTelethonPhase:
         mock_client.disconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_timeout_cancels_underlying_connect_work(self) -> None:
+        """wait_for must stop the connect coroutine, not return while it continues."""
+        still_running = True
+
+        async def hang_connect(*_args: object, **_kwargs: object) -> None:
+            nonlocal still_running
+            try:
+                await asyncio.sleep(30)
+            finally:
+                still_running = False
+
+        mock_client = _mock_client(connect=hang_connect)
+        tcp_patch, client_patch = _phase2_and_client(mock_client)
+        with tcp_patch, client_patch:
+            result = await probe_proxy(
+                proxy_id=13,
+                server="1.1.1.1",
+                port=443,
+                secret="dd" + "11" * 16,
+                secret_type=SecretType.SECURE_RANDOMIZED,
+                api_id=DUMMY_API_ID,
+                api_hash=DUMMY_API_HASH,
+                mtproto_timeout_seconds=0.05,
+                total_timeout_seconds=0.2,
+            )
+
+        assert result.success is False
+        assert result.error_category == ErrorCategory.MT_PROTO_TIMEOUT
+        assert result.tcp_connect_ms is not None
+        assert result.mtproto_connect_ms is None
+        assert still_running is False
+        mock_client.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_total_timeout_during_tcp_is_tcp_timeout_not_mtproto(self) -> None:
+        async def hang_tcp(*_args: object, **_kwargs: object) -> tuple[object, object]:
+            await asyncio.sleep(30)
+            msg = "open_connection was not cancelled"
+            raise AssertionError(msg)
+
+        with patch("asyncio.open_connection", side_effect=hang_tcp):
+            result = await probe_proxy(
+                proxy_id=14,
+                server="1.1.1.1",
+                port=443,
+                secret="dd" + "11" * 16,
+                secret_type=SecretType.SECURE_RANDOMIZED,
+                tcp_timeout_seconds=30.0,
+                total_timeout_seconds=0.05,
+            )
+
+        assert result.success is False
+        assert result.error_category == ErrorCategory.TCP_TIMEOUT
+        assert result.tcp_connect_ms is None
+
+    @pytest.mark.asyncio
     async def test_secret_is_never_leaked_in_error_message(self) -> None:
         raw_secret = "dd" + "ab" * 16
         with patch(
@@ -386,3 +451,13 @@ class TestProbeTelethonPhase:
             )
             assert result.success is False
             assert raw_secret not in (result.error_message_safe or "")
+
+
+class TestProbeSessionHygiene:
+    def test_probe_source_never_opens_a_sqlite_session(self) -> None:
+        from pathlib import Path
+
+        source = Path(probe_proxy.__code__.co_filename).read_text(encoding="utf-8")
+        assert "MemorySession" in source
+        assert "SQLiteSession" not in source
+        assert "StringSession" not in source

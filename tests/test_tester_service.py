@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core.identity import ProxySecret
-from core.models import Proxy
+from core.models import ErrorCategory, Proxy
 from modules.tester.models import TesterResult, TransportType
 from modules.tester.service import TesterService
 
@@ -122,3 +122,121 @@ class TestTesterServiceUnit:
             assert results[0].success is True
             # Verify record_result executed queries in session 2
             assert mock_session.execute.await_count == 2  # obs insert + proxy update
+
+    @pytest.mark.asyncio
+    async def test_cancelled_batch_records_cancelled_and_reraises(self) -> None:
+        mock_db = MagicMock()
+        mock_session = AsyncMock()
+
+        class DummyScope:
+            async def __aenter__(self) -> AsyncMock:
+                return mock_session
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+        mock_db.session_scope.side_effect = lambda: DummyScope()
+        service = TesterService(mock_db)
+        recorded: list[TesterResult] = []
+
+        async def capture(_session: object, result: TesterResult) -> None:
+            recorded.append(result)
+
+        proxy = Proxy(
+            id=7,
+            server="1.1.1.1",
+            port=443,
+            secret=ProxySecret("dd" + "11" * 16),
+            fingerprint="a" * 64,
+        )
+
+        async def hang(*_args: object, **_kwargs: object) -> TesterResult:
+            await asyncio.sleep(30)
+            msg = "probe was not cancelled"
+            raise AssertionError(msg)
+
+        with (
+            patch("modules.tester.service.claim_due_proxies", return_value=[proxy]),
+            patch("modules.tester.service.probe_proxy", side_effect=hang),
+            patch.object(service, "record_result", side_effect=capture),
+        ):
+            runner = asyncio.create_task(service.run_batch())
+            await asyncio.sleep(0.02)
+            runner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await runner
+
+        assert len(recorded) == 1
+        assert recorded[0].success is False
+        assert recorded[0].error_category == ErrorCategory.CANCELLED
+        assert recorded[0].proxy_id == 7
+
+    @pytest.mark.asyncio
+    async def test_worker_tick_timeout_bounds_hanging_batch_and_next_tick_runs(self) -> None:
+        """A finite tick timeout must stop a hung batch without poisoning tick N+1."""
+        from core.lifecycle import WorkerLifecycle
+        from tests.conftest import make_settings
+
+        mock_db = MagicMock()
+        mock_session = AsyncMock()
+
+        class DummyScope:
+            async def __aenter__(self) -> AsyncMock:
+                return mock_session
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+        mock_db.session_scope.side_effect = lambda: DummyScope()
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            worker_error_backoff_seconds=0.0,
+            worker_max_error_backoff_seconds=0.0,
+            worker_tick_timeout_seconds=0.05,
+        )
+        service = TesterService(mock_db)
+        recorded: list[TesterResult] = []
+        still_running = True
+
+        async def capture(_session: object, result: TesterResult) -> None:
+            recorded.append(result)
+
+        proxy = Proxy(
+            id=9,
+            server="1.1.1.1",
+            port=443,
+            secret=ProxySecret("dd" + "11" * 16),
+            fingerprint="b" * 64,
+        )
+
+        async def hang(*_args: object, **_kwargs: object) -> TesterResult:
+            nonlocal still_running
+            try:
+                await asyncio.sleep(30)
+                msg = "probe was not cancelled by tick timeout"
+                raise AssertionError(msg)
+            finally:
+                still_running = False
+
+        with (
+            patch("modules.tester.service.claim_due_proxies", return_value=[proxy]),
+            patch("modules.tester.service.probe_proxy", side_effect=hang),
+            patch.object(service, "record_result", side_effect=capture),
+        ):
+
+            async def tick(life: WorkerLifecycle) -> None:
+                if life.tick_count >= 2:
+                    life.request_shutdown("second-tick")
+                    return
+                await service.run_batch()
+
+            life = WorkerLifecycle("tester-worker", settings=settings)
+            await life.run(tick, interval=0.0)
+
+        assert still_running is False
+        assert recorded
+        assert recorded[0].error_category == ErrorCategory.CANCELLED
+        assert life.tick_count == 2
+        assert life.failure_count >= 1
+        assert life.shutdown_reason == "second-tick"

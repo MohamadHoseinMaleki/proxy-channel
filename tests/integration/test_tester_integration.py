@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -145,3 +146,59 @@ async def test_tester_worker_tick_integration(db: Database) -> None:
         obs = (await session.execute(select(ProxyObservation))).scalars().all()
         assert len(obs) == 1
         assert obs[0].success is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_batch_releases_lease(db: Database) -> None:
+    """In-process cancellation must not leave test_lock_until set."""
+    p = make_proxy(server="198.51.100.9", port=443, secret="dd" + "99" * 16)
+    async with db.session_scope() as session:
+        session.add(p)
+
+    service = TesterService(db, batch_size=5)
+
+    async def hang(*_args: object, **_kwargs: object) -> TesterResult:
+        await asyncio.sleep(30)
+        msg = "probe was not cancelled"
+        raise AssertionError(msg)
+
+    with patch("modules.tester.service.probe_proxy", side_effect=hang):
+        runner = asyncio.create_task(service.run_batch())
+        await asyncio.sleep(0.05)
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+
+    async with db.session_scope() as session:
+        stored = (await session.execute(select(Proxy))).scalar_one()
+        assert stored.test_lock_until is None
+        obs = (await session.execute(select(ProxyObservation))).scalars().all()
+        assert len(obs) == 1
+        assert obs[0].success is False
+        assert obs[0].error_category == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_unrecorded_claim_is_reclaimable_after_lease_expiry(db: Database) -> None:
+    """Process kill never clears the lease; expiry must make the row due again."""
+    from modules.scheduling import claim_due_proxies
+
+    p = make_proxy(server="198.51.100.10", port=443, secret="dd" + "aa" * 16)
+    async with db.session_scope() as session:
+        session.add(p)
+
+    moment = utcnow()
+    async with db.session_scope() as session:
+        claimed = await claim_due_proxies(session, lease_seconds=30, now=moment)
+        assert len(claimed) == 1
+        assert claimed[0].test_lock_until == moment + timedelta(seconds=30)
+
+    # Still leased: a second tester must skip it.
+    async with db.session_scope() as session:
+        assert await claim_due_proxies(session, now=moment + timedelta(seconds=5)) == []
+
+    # After expiry (and without any record_result / cleanup): reclaimable.
+    async with db.session_scope() as session:
+        reclaimed = await claim_due_proxies(session, now=moment + timedelta(seconds=31))
+        assert len(reclaimed) == 1
+        assert reclaimed[0].server == "198.51.100.10"

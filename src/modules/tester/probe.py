@@ -16,6 +16,8 @@ Guarantees:
 * Does not require user authentication (start() or sign_in()).
 * Cancellation propagates cleanly without being converted into failure.
 * Secrets and API hashes are strictly excluded from error messages and logs.
+* A finite timeout actually cancels in-flight async work; it does not return
+  while a probe task keeps running in the background.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from typing import Final
+from typing import TYPE_CHECKING, Final, Literal
 
 from telethon import TelegramClient
 from telethon.errors import RPCError
@@ -31,10 +33,10 @@ from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 from telethon.tl.types import Config
 
-from core.logger import get_logger, safe_error_message
+from core.logger import safe_error_message
 from core.models import ErrorCategory
 from modules.discovery.models import SecretType
-from modules.tester.models import TesterResult
+from modules.tester.models import TesterResult, TransportType
 from modules.tester.resolver import (
     DestinationBlockedError,
     DnsResolutionError,
@@ -42,9 +44,10 @@ from modules.tester.resolver import (
 )
 from modules.tester.transport import select_transport
 
-__all__ = ["API_VERIFY_REQUEST_CLS", "probe_proxy"]
+if TYPE_CHECKING:
+    from modules.tester.transport import TransportSelection
 
-_logger = get_logger("modules.tester.probe")
+__all__ = ["API_VERIFY_REQUEST_CLS", "probe_proxy"]
 
 DEFAULT_TCP_TIMEOUT: Final = 3.0
 DEFAULT_MTPROTO_TIMEOUT: Final = 8.0
@@ -64,10 +67,20 @@ DEFAULT_TOTAL_TIMEOUT: Final = 15.0
 # not proof of API connectivity, and it is not a proxy failure either.
 API_VERIFY_REQUEST_CLS: Final[type[GetConfigRequest]] = GetConfigRequest
 
+_Phase = Literal["dns", "tcp", "mtproto"]
+
 
 def _is_verified_api_response(result: object) -> bool:
     """True only when Telegram answered help.getConfig with a Config object."""
     return isinstance(result, Config) and bool(getattr(result, "dc_options", None))
+
+
+def _remaining_timeout(deadline: float) -> float:
+    """Seconds left before the probe deadline. Raises ``TimeoutError`` if none."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("probe deadline exceeded")
+    return left
 
 
 async def probe_proxy(
@@ -85,22 +98,23 @@ async def probe_proxy(
 ) -> TesterResult:
     """Execute a full 3-phase connectivity test against an MTProto proxy."""
     t_start = time.monotonic()
-
+    # Phase-aware budget: each stage is capped by both its own timeout and the
+    # remaining total. An outer wait_for around the whole coroutine would
+    # discard TCP timings when the MTProto stage later timed out.
+    deadline = t_start + max(0.0, float(total_timeout_seconds))
     try:
-        return await asyncio.wait_for(
-            _execute_probe(
-                proxy_id=proxy_id,
-                server=server,
-                port=port,
-                secret=secret,
-                secret_type=secret_type,
-                api_id=api_id,
-                api_hash=api_hash,
-                tcp_timeout=tcp_timeout_seconds,
-                mtproto_timeout=mtproto_timeout_seconds,
-                t_start=t_start,
-            ),
-            timeout=total_timeout_seconds,
+        return await _execute_probe(
+            proxy_id=proxy_id,
+            server=server,
+            port=port,
+            secret=secret,
+            secret_type=secret_type,
+            api_id=api_id,
+            api_hash=api_hash,
+            tcp_timeout=tcp_timeout_seconds,
+            mtproto_timeout=mtproto_timeout_seconds,
+            t_start=t_start,
+            deadline=deadline,
         )
     except asyncio.CancelledError:
         raise
@@ -125,113 +139,141 @@ async def _execute_probe(
     tcp_timeout: float,
     mtproto_timeout: float,
     t_start: float,
+    deadline: float,
 ) -> TesterResult:
-    # -----------------------------------------------------------------------
-    # Phase 1: DNS & SSRF Validation (DNS Rebinding Protected)
-    # -----------------------------------------------------------------------
-    try:
-        pinned_ip, _ = await resolve_and_validate_destination(server, port)
-    except DestinationBlockedError as exc:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            error_category=ErrorCategory.SSRF_BLOCKED,
-            error_message_safe=safe_error_message(exc),
-        )
-    except DnsResolutionError as exc:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            error_category=ErrorCategory.DNS_ERROR,
-            error_message_safe=safe_error_message(exc),
-        )
-
-    # -----------------------------------------------------------------------
-    # Phase 2: TCP Connection & Latency Measurement
-    # -----------------------------------------------------------------------
-    t_tcp = time.monotonic()
-    try:
-        _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(pinned_ip, port),
-            timeout=tcp_timeout,
-        )
-        tcp_ms = (time.monotonic() - t_tcp) * 1000.0
-        writer.close()
-        await writer.wait_closed()
-    except TimeoutError:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.TCP_TIMEOUT,
-            error_message_safe=f"TCP connection timed out after {tcp_timeout}s",
-        )
-    except ConnectionRefusedError:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.TCP_REFUSED,
-            error_message_safe="TCP connection refused by target host",
-        )
-    except ConnectionResetError:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.TCP_RESET,
-            error_message_safe="TCP connection reset by target host",
-        )
-    except OSError as exc:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.TCP_ERROR,
-            error_message_safe=safe_error_message(exc),
-        )
-
-    # -----------------------------------------------------------------------
-    # Phase 3: MTProto Transport & API Verification
-    # -----------------------------------------------------------------------
-    try:
-        bytes.fromhex(secret)
-    except ValueError:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            tcp_connect_ms=tcp_ms,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.INVALID_SECRET,
-            error_message_safe="Proxy secret is not valid hexadecimal",
-        )
-
-    selection = select_transport(secret_type)
-    if not selection.is_supported or selection.transport_cls is None:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            tcp_connect_ms=tcp_ms,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.UNSUPPORTED_TRANSPORT,
-            error_message_safe=selection.reason,
-            transport_type=selection.transport_type,
-        )
-
-    if not api_id or not api_hash:
-        return TesterResult(
-            proxy_id=proxy_id,
-            success=False,
-            tcp_connect_ms=tcp_ms,
-            target_ip=pinned_ip,
-            error_category=ErrorCategory.API_AUTH_ERROR,
-            error_message_safe="TELEGRAM_API_ID and TELEGRAM_API_HASH are not configured",
-            transport_type=selection.transport_type,
-        )
-
+    phase: _Phase = "dns"
+    tcp_ms: float | None = None
+    pinned_ip: str | None = None
+    writer = None
     client: TelegramClient | None = None
-    t_mtp = time.monotonic()
+    selection: TransportSelection | None = None
+
     try:
+        # -------------------------------------------------------------------
+        # Cheap rejections before any socket: secret syntax + Fake-TLS.
+        # Unit tests must not open a real connection to a public IP merely to
+        # classify an unsupported transport.
+        # -------------------------------------------------------------------
+        try:
+            bytes.fromhex(secret)
+        except ValueError:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                error_category=ErrorCategory.INVALID_SECRET,
+                error_message_safe="Proxy secret is not valid hexadecimal",
+            )
+
+        selection = select_transport(secret_type)
+        if not selection.is_supported or selection.transport_cls is None:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                error_category=ErrorCategory.UNSUPPORTED_TRANSPORT,
+                error_message_safe=selection.reason,
+                transport_type=selection.transport_type,
+            )
+
+        # -------------------------------------------------------------------
+        # Phase 1: DNS & SSRF Validation (DNS Rebinding Protected)
+        # -------------------------------------------------------------------
+        try:
+            pinned_ip, _ = await asyncio.wait_for(
+                resolve_and_validate_destination(server, port),
+                timeout=_remaining_timeout(deadline),
+            )
+        except DestinationBlockedError as exc:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                error_category=ErrorCategory.SSRF_BLOCKED,
+                error_message_safe=safe_error_message(exc),
+                transport_type=selection.transport_type,
+            )
+        except DnsResolutionError as exc:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                error_category=ErrorCategory.DNS_ERROR,
+                error_message_safe=safe_error_message(exc),
+                transport_type=selection.transport_type,
+            )
+        except TimeoutError:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                error_category=ErrorCategory.DNS_TIMEOUT,
+                error_message_safe="DNS resolution timed out",
+                transport_type=selection.transport_type,
+            )
+
+        # -------------------------------------------------------------------
+        # Phase 2: TCP Connection & Latency Measurement
+        # -------------------------------------------------------------------
+        phase = "tcp"
+        t_tcp = time.monotonic()
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(pinned_ip, port),
+                timeout=min(tcp_timeout, _remaining_timeout(deadline)),
+            )
+            tcp_ms = (time.monotonic() - t_tcp) * 1000.0
+            writer.close()
+            await writer.wait_closed()
+            writer = None
+        except TimeoutError:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.TCP_TIMEOUT,
+                error_message_safe=f"TCP connection timed out after {tcp_timeout}s",
+                transport_type=selection.transport_type,
+            )
+        except ConnectionRefusedError:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.TCP_REFUSED,
+                error_message_safe="TCP connection refused by target host",
+                transport_type=selection.transport_type,
+            )
+        except ConnectionResetError:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.TCP_RESET,
+                error_message_safe="TCP connection reset by target host",
+                transport_type=selection.transport_type,
+            )
+        except OSError as exc:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.TCP_ERROR,
+                error_message_safe=safe_error_message(exc),
+                transport_type=selection.transport_type,
+            )
+
+        if not api_id or not api_hash:
+            return TesterResult(
+                proxy_id=proxy_id,
+                success=False,
+                tcp_connect_ms=tcp_ms,
+                target_ip=pinned_ip,
+                error_category=ErrorCategory.API_AUTH_ERROR,
+                error_message_safe="TELEGRAM_API_ID and TELEGRAM_API_HASH are not configured",
+                transport_type=selection.transport_type,
+            )
+
+        # -------------------------------------------------------------------
+        # Phase 3: MTProto Transport & API Verification
+        # -------------------------------------------------------------------
+        phase = "mtproto"
+        t_mtp = time.monotonic()
         client = TelegramClient(
             MemorySession(),
             api_id=int(api_id),
@@ -243,12 +285,15 @@ async def _execute_probe(
             receive_updates=False,
         )
 
-        await asyncio.wait_for(client.connect(), timeout=mtproto_timeout)
+        await asyncio.wait_for(
+            client.connect(),
+            timeout=min(mtproto_timeout, _remaining_timeout(deadline)),
+        )
         # Transport being up is not enough. Verify a real unauthenticated
         # Telegram API RPC through the proxy and require a Config response.
         config = await asyncio.wait_for(
             client(API_VERIFY_REQUEST_CLS()),
-            timeout=mtproto_timeout,
+            timeout=min(mtproto_timeout, _remaining_timeout(deadline)),
         )
         if not _is_verified_api_response(config):
             return TesterResult(
@@ -279,14 +324,27 @@ async def _execute_probe(
     except asyncio.CancelledError:
         raise
     except TimeoutError:
+        if phase == "dns":
+            category = ErrorCategory.DNS_TIMEOUT
+            message = "DNS resolution timed out"
+        elif phase == "tcp":
+            category = ErrorCategory.TCP_TIMEOUT
+            message = f"TCP connection timed out after {tcp_timeout}s"
+        else:
+            category = ErrorCategory.MT_PROTO_TIMEOUT
+            message = f"MTProto handshake timed out after {mtproto_timeout}s"
         return TesterResult(
             proxy_id=proxy_id,
             success=False,
             tcp_connect_ms=tcp_ms,
             target_ip=pinned_ip,
-            error_category=ErrorCategory.MT_PROTO_TIMEOUT,
-            error_message_safe=f"MTProto handshake timed out after {mtproto_timeout}s",
-            transport_type=selection.transport_type,
+            error_category=category,
+            error_message_safe=message,
+            transport_type=(
+                selection.transport_type
+                if selection is not None
+                else TransportType.RANDOMIZED_INTERMEDIATE
+            ),
         )
     except ConnectionError as exc:
         msg = str(exc)
@@ -302,7 +360,11 @@ async def _execute_probe(
             target_ip=pinned_ip,
             error_category=category,
             error_message_safe=safe_error_message(exc),
-            transport_type=selection.transport_type,
+            transport_type=(
+                selection.transport_type
+                if selection is not None
+                else TransportType.RANDOMIZED_INTERMEDIATE
+            ),
         )
     except RPCError as exc:
         return TesterResult(
@@ -312,7 +374,11 @@ async def _execute_probe(
             target_ip=pinned_ip,
             error_category=ErrorCategory.TELEGRAM_RPC_ERROR,
             error_message_safe=safe_error_message(exc),
-            transport_type=selection.transport_type,
+            transport_type=(
+                selection.transport_type
+                if selection is not None
+                else TransportType.RANDOMIZED_INTERMEDIATE
+            ),
         )
     except Exception as exc:
         return TesterResult(
@@ -322,9 +388,17 @@ async def _execute_probe(
             target_ip=pinned_ip,
             error_category=ErrorCategory.UNKNOWN_ERROR,
             error_message_safe=safe_error_message(exc),
-            transport_type=selection.transport_type,
+            transport_type=(
+                selection.transport_type
+                if selection is not None
+                else TransportType.RANDOMIZED_INTERMEDIATE
+            ),
         )
     finally:
+        if writer is not None:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.disconnect()

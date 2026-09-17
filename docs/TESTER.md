@@ -32,22 +32,16 @@ against MTProxy protocols:
 * `ConnectionTcpMTProxyIntermediate`: 4-byte length prefix, legacy 16-byte secrets only.
 * `ConnectionTcpMTProxyAbridged`: 1-byte length prefix, legacy 16-byte secrets only.
 
-### Fake-TLS (`0xee`) Limitation
-* In `telethon.network.connection.tcpmtproxy.TcpMTProxy.normalize_secret`, Telethon
-  parses `0xee` secrets by stripping the prefix and truncating the secret to 16 bytes:
-  ```python
-  if secret.startswith(b"\xee"):
-      # fake-TLS secret format: ee + 16-byte-secret + domain
-      # for now, the domain is ignored until domain support is added
-      return secret[1:17]
-  ```
-* Telethon's `MTProxyIO` **does not implement wire-level TLS emulation**: it generates
-  neither a TLS `ClientHello` handshake nor the server name indication (SNI) extension.
-* Real Fake-TLS proxies that enforce TLS handshakes will drop or reset connections
-  from standard Telethon clients.
-* **Decision**: Rather than fabricating support or producing inaccurate timeout errors,
-  the tester classifies Fake-TLS secrets as `UNSUPPORTED_TRANSPORT` with an honest
-  diagnostic message explaining this limitation.
+### Fake-TLS (`0xee`) Limitation (re-audited against Telethon 1.45.0)
+* `TcpMTProxy.normalize_secret` still strips an `ee`/`dd` prefix and returns
+  `secret_bytes[:16]` with the comment *"until domain support is added"*. The SNI
+  domain is discarded.
+* `MTProxyIO.init_header` special-cases only 17-byte `0xDD` secrets; it emits the
+  obfuscated 64-byte MTProxy header. There is no TLS record layer, no `ClientHello`,
+  and no SNI.
+* **Decision**: Fake-TLS remains `UNSUPPORTED_TRANSPORT`. We do not silently
+  downgrade to Randomized Intermediate, and we do not open a TCP socket merely to
+  classify an `ee` secret. No live Fake-TLS proxy was verified in this environment.
 
 ### Built-in 2-Second Latency Floor
 * In `TcpMTProxy._connect()`:
@@ -162,6 +156,12 @@ The `mtproto-tester` worker coordinates execution as an independent OS process:
 * **Crash Recovery**: If a worker is hard-killed (`kill -9`), uncompleted claims
   expire after `DEFAULT_LEASE_SECONDS` (300 s) and are automatically picked up
   by other workers.
+* **In-process cancel/timeout**: `run_batch` writes a `CANCELLED` (or the
+  phase-classified timeout) observation, clears `test_lock_until`, then
+  re-raises `CancelledError`. A single pathological handshake is bounded by
+  `TESTER_*_TIMEOUT_SECONDS` per proxy and optionally by
+  `WORKER_TICK_TIMEOUT_SECONDS` for the whole tick. Timeouts cancel the
+  underlying awaitable; they do not return while Telethon work keeps running.
 
 ---
 
