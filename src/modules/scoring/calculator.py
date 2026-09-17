@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Final
 
 from core.models import SCORING_VERSION_V1
-from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreStatus
+from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreFreshness, ScoreStatus
 
 __all__ = [
     "CONFIDENCE_PRIOR_N",
@@ -125,6 +125,9 @@ def score_observations(
             status=ScoreStatus.NO_OBSERVATIONS_IN_WINDOW,
             scoring_version=SCORING_VERSION_V1,
             calculated_at=now,
+            last_success_at=None,
+            mean_mtproto_ms=None,
+            freshness=ScoreFreshness.STALE,
         )
 
     weight_sum = 0.0
@@ -156,13 +159,16 @@ def score_observations(
         mean_latency = weighted_latency / latency_weight_sum
         latency_score = _latency_score(mean_latency)
         p50, p95 = _percentiles(latency_samples)
+        mean_ms = _ms_decimal(mean_latency)
     else:
         latency_score = 0.0
         p50, p95 = None, None
+        mean_ms = None
 
     confidence_factor = n / (n + CONFIDENCE_PRIOR_N)
     combined = RELIABILITY_WEIGHT * reliability_score + LATENCY_WEIGHT * latency_score
     final = combined * confidence_factor
+    last_success_at, freshness = _freshness(in_window, now)
 
     return ScoreBreakdown(
         proxy_id=proxy_id,
@@ -186,6 +192,9 @@ def score_observations(
         status=ScoreStatus.SCORED,
         scoring_version=SCORING_VERSION_V1,
         calculated_at=now,
+        last_success_at=last_success_at,
+        mean_mtproto_ms=mean_ms,
+        freshness=freshness,
     )
 
 
@@ -262,6 +271,21 @@ def _percentile(sorted_values: list[float], percent: float) -> float:
         return sorted_values[low]
     frac = rank - low
     return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+
+
+def _freshness(
+    observations: Sequence[ObservationInput], now: datetime
+) -> tuple[datetime | None, ScoreFreshness]:
+    last_success: datetime | None = None
+    for item in observations:
+        if item.success and (last_success is None or item.observed_at > last_success):
+            last_success = item.observed_at
+    if last_success is None:
+        return None, ScoreFreshness.STALE
+    age_hours = (now - last_success).total_seconds() / 3600.0
+    if age_hours < WINDOW_6H:
+        return last_success, ScoreFreshness.RECENT
+    return last_success, ScoreFreshness.AGING
 
 
 def _failure_counts(observations: Sequence[ObservationInput]) -> tuple[tuple[str, int], ...]:

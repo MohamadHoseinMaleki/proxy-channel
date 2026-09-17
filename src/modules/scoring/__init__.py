@@ -11,7 +11,7 @@ from modules.scoring.calculator import (
     RELIABILITY_WEIGHT,
     score_observations,
 )
-from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreStatus
+from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreFreshness, ScoreStatus
 from modules.scoring.service import ScoringService
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "RELIABILITY_WEIGHT",
     "ObservationInput",
     "ScoreBreakdown",
+    "ScoreFreshness",
     "ScoreStatus",
     "ScoringService",
     "score_observations",

@@ -21,9 +21,12 @@ from modules.scoring.calculator import (
     LOOKBACK_HOURS,
     RECENCY_HALF_LIFE_HOURS,
     RELIABILITY_WEIGHT,
+    WINDOW_1H,
+    WINDOW_6H,
+    WINDOW_24H,
     score_observations,
 )
-from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreStatus
+from modules.scoring.models import ObservationInput, ScoreBreakdown, ScoreFreshness, ScoreStatus
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 SCORING_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "modules" / "scoring"
@@ -121,6 +124,9 @@ class TestEmptyData:
         assert result.sample_count_24h == 0
         assert result.latency_p50_ms is None
         assert result.latency_p95_ms is None
+        assert result.mean_mtproto_ms is None
+        assert result.last_success_at is None
+        assert result.freshness is ScoreFreshness.STALE
         assert result.scoring_version == SCORING_VERSION_V1
 
     def test_all_observations_older_than_lookback(self) -> None:
@@ -142,6 +148,8 @@ class TestPerfectUnstableDead:
         assert dead.successful_count == 0
         assert dead.latency_score == Decimal("0.000")
         assert dead.latency_p50_ms is None
+        assert dead.freshness is ScoreFreshness.STALE
+        assert perfect.freshness is ScoreFreshness.RECENT
 
     def test_ten_of_ten_raw_window_reliability_is_100(self) -> None:
         result = score_observations(1, _n_success(10), now=NOW)
@@ -283,7 +291,19 @@ class TestFailureCategories:
         items = _n_failure(6, category=ErrorCategory.UNSUPPORTED_TRANSPORT)
         result = score_observations(1, items, now=NOW)
         assert result.successful_count == 0
+        assert result.latency_p50_ms is None
+        assert result.freshness is ScoreFreshness.STALE
         assert result.failure_counts == ((ErrorCategory.UNSUPPORTED_TRANSPORT, 6),)
+        # Not ranked as verified: score stays below a single recent GetConfig success.
+        verified = score_observations(2, _n_success(1, mtproto=2100.0), now=NOW)
+        assert result.score < verified.score
+
+    def test_cancelled_is_not_a_success_or_a_latency_sample(self) -> None:
+        items = _n_failure(4, category=ErrorCategory.CANCELLED) + _n_success(1, mtproto=2100.0)
+        result = score_observations(1, items, now=NOW)
+        assert result.successful_count == 1
+        assert result.failure_counts == ((ErrorCategory.CANCELLED, 4),)
+        assert result.latency_p50_ms == Decimal("2100.000")
 
     def test_missing_category_is_counted_as_unknown(self) -> None:
         items = [_obs(0.1, success=False, category=None)]
@@ -378,3 +398,92 @@ class TestBoundaries:
         for rendered in (repr(item), repr(result)):
             assert "secret" not in rendered.lower()
             assert "ee" not in rendered
+
+
+class TestWindows:
+    def test_1h_6h_24h_boundaries_are_inclusive(self) -> None:
+        items = [
+            _obs(0.5, success=True, mtproto=2100.0),
+            _obs(WINDOW_1H, success=True, mtproto=2100.0),
+            _obs(3.0, success=False, category=ErrorCategory.TCP_REFUSED),
+            _obs(WINDOW_6H, success=True, mtproto=2100.0),
+            _obs(12.0, success=False, category=ErrorCategory.MT_PROTO_TIMEOUT),
+            _obs(WINDOW_24H, success=True, mtproto=2100.0),
+            _obs(WINDOW_24H + 0.01, success=True, mtproto=2100.0),
+        ]
+        result = score_observations(1, items, now=NOW)
+        assert result.sample_count_1h == 2
+        assert result.sample_count_6h == 4
+        assert result.sample_count_24h == 6
+        assert result.observation_count == 6
+        assert result.reliability_1h == Decimal("100.000")
+        assert result.reliability_6h == Decimal("75.000")
+        assert result.reliability_24h == Decimal("66.667")
+
+    def test_empty_inner_window_is_null_not_zero(self) -> None:
+        items = [_obs(12.0, success=True, mtproto=2100.0)]
+        result = score_observations(1, items, now=NOW)
+        assert result.sample_count_1h == 0
+        assert result.reliability_1h is None
+        assert result.sample_count_6h == 0
+        assert result.reliability_6h is None
+        assert result.sample_count_24h == 1
+        assert result.reliability_24h == Decimal("100.000")
+        assert result.freshness is ScoreFreshness.AGING
+
+
+class TestPercentilesAndMean:
+    def test_linear_interpolation_percentiles_are_order_independent(self) -> None:
+        latencies = [5000.0, 1000.0, 4000.0, 2000.0, 3000.0]
+        items = [_obs(0.01 * i, success=True, mtproto=ms) for i, ms in enumerate(latencies)]
+        result = score_observations(1, items, now=NOW)
+        # n=5, rank_p50 = 0.5*(n-1)=2 → 3000; rank_p95=0.95*4=3.8 → 4000*0.2+5000*0.8
+        assert result.latency_p50_ms == Decimal("3000.000")
+        assert result.latency_p95_ms == Decimal("4800.000")
+        shuffled = list(reversed(items))
+        again = score_observations(1, shuffled, now=NOW)
+        assert again.latency_p50_ms == result.latency_p50_ms
+        assert again.latency_p95_ms == result.latency_p95_ms
+
+    def test_mean_mtproto_ignores_tcp_and_failures(self) -> None:
+        items = [
+            _obs(0.0, success=True, mtproto=2000.0, tcp=5.0),
+            _obs(0.0, success=True, mtproto=4000.0, tcp=5.0),
+            _obs(0.0, success=False, mtproto=50.0, category=ErrorCategory.TCP_TIMEOUT),
+        ]
+        result = score_observations(1, items, now=NOW)
+        assert result.mean_mtproto_ms == Decimal("3000.000")
+
+
+class TestFreshness:
+    def test_recent_aging_and_stale(self) -> None:
+        recent = score_observations(1, [_obs(1.0, success=True, mtproto=2100.0)], now=NOW)
+        aging = score_observations(2, [_obs(12.0, success=True, mtproto=2100.0)], now=NOW)
+        stale = score_observations(3, _n_failure(3), now=NOW)
+        assert recent.freshness is ScoreFreshness.RECENT
+        assert aging.freshness is ScoreFreshness.AGING
+        assert stale.freshness is ScoreFreshness.STALE
+        assert recent.last_success_at == NOW - timedelta(hours=1.0)
+        assert aging.last_success_at == NOW - timedelta(hours=12.0)
+        assert stale.last_success_at is None
+
+
+class TestWorkedExampleAndMonotonicity:
+    def test_ten_recent_successes_at_2100ms_match_the_documented_v1_example(self) -> None:
+        items = [_obs(0.0, success=True, mtproto=2100.0) for _ in range(10)]
+        result = score_observations(1, items, now=NOW)
+        reliability = 100.0 * (10.0 + 1.0) / (10.0 + 2.0)
+        latency = 100.0 * (1.0 - 2100.0 / 8000.0)
+        combined = 0.75 * reliability + 0.25 * latency
+        expected = combined * (10.0 / 20.0)
+        assert result.reliability_score == Decimal("91.667")
+        assert result.latency_score == Decimal("73.750")
+        assert result.confidence_factor == pytest.approx(0.5)
+        assert expected == pytest.approx(43.59375)
+        assert result.score == Decimal("43.594")
+
+    def test_more_identical_successes_do_not_lower_the_score(self) -> None:
+        fewer = score_observations(1, _n_success(5, hours_ago=0.0, mtproto=2100.0), now=NOW)
+        more = score_observations(2, _n_success(20, hours_ago=0.0, mtproto=2100.0), now=NOW)
+        assert more.score > fewer.score
+        assert more.confidence_factor > fewer.confidence_factor

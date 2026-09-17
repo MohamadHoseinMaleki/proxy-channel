@@ -298,6 +298,51 @@ async def test_empty_window_inserts_zero_and_is_not_reclaimed(db: Database) -> N
 
 
 @pytest.mark.asyncio
+async def test_unsupported_and_cancelled_are_not_persisted_as_success(db: Database) -> None:
+    now = utcnow()
+    async with db.session_scope() as session:
+        proxy = make_proxy(server="198.51.100.52", port=443, secret="dd" + "33" * 16)
+        proxy.last_test_finished_at = now
+        session.add(proxy)
+        await session.flush()
+        session.add_all(
+            [
+                _observation(
+                    proxy.id,
+                    success=False,
+                    hours_ago=0.1,
+                    now=now,
+                    category=ErrorCategory.UNSUPPORTED_TRANSPORT,
+                ),
+                _observation(
+                    proxy.id,
+                    success=False,
+                    hours_ago=0.2,
+                    now=now,
+                    category=ErrorCategory.CANCELLED,
+                ),
+            ]
+        )
+
+    results = await ScoringService(db, batch_size=5).run_batch()
+    assert len(results) == 1
+    assert results[0].successful_count == 0
+    assert results[0].latency_p50_ms is None
+    assert results[0].score >= Decimal("0.000")
+
+    async with db.session_scope() as session:
+        obs = (await session.execute(select(ProxyObservation))).scalars().all()
+        assert {row.error_category for row in obs} == {
+            ErrorCategory.UNSUPPORTED_TRANSPORT,
+            ErrorCategory.CANCELLED,
+        }
+        assert all(row.success is False for row in obs)
+        score = (await session.execute(select(ProxyScore))).scalar_one()
+        assert score.sample_count_24h == 2
+        assert score.reliability_24h == Decimal("0.000")
+
+
+@pytest.mark.asyncio
 async def test_scorer_worker_tick_persists_and_does_not_rescore_until_new_test(
     db: Database,
 ) -> None:

@@ -15,7 +15,7 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–010 complete
+## ⚠️ Current status: Tasks 001–011 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
@@ -44,7 +44,8 @@ scores are computed from persisted (often synthetic) observations. See
 | 008 | Production discovery worker, upsert, SSRF/HTTP hardening | ✅ **complete** |
 | 009 | Production worker runtime (shutdown, isolation, no overlap) | ✅ **complete** |
 | 010 | Tester timeouts, transport verification, lease-on-cancel | ✅ **complete** |
-| 011–012 | Reporting, Telegram publishing, AI content | ⬜ not started |
+| 011 | Production scoring engine (v1 formula, append-only snapshots) | ✅ **complete** |
+| 012 | Reporting, Telegram publishing, AI content | ⬜ not started |
 | 013–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
 ---
@@ -112,19 +113,19 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 uv sync                        # create .venv and install everything
 cp .env.example .env           # optional; development defaults already work
 
-uv run pytest                  # 854 passed, 200 skipped (no database)
+uv run pytest                  # 863 passed, 201 skipped (no database)
 uv run ruff check .            # All checks passed
 uv run ruff format --check .   # files already formatted
 uv run mypy .                  # Success: no issues found in 82 source files
 ```
 
-To also run the 198 integration tests, provision a local PostgreSQL — Docker is
+To also run the 201 integration tests, provision a local PostgreSQL — Docker is
 **not** required:
 
 ```bash
 uv run --with pgserver python scripts/dev_pg.py run -- uv run alembic upgrade head
 uv run --with pgserver python scripts/dev_pg.py run -- uv run pytest
-                               # 1054 passed
+                               # 1064 passed
 ```
 
 `pgserver` is fetched ad hoc and is never added to the project dependencies. Any

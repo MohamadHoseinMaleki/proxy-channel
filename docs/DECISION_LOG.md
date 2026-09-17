@@ -8,6 +8,55 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 011 — Production scoring engine
+
+### D-045 · Keep v1 formula and schema; isolate per-proxy compute; derive freshness in process
+
+**Context.** Task 005 already shipped the deterministic scorer (`score_observations`,
+append-only `ProxyScore`, `mtproto-scorer` on `WorkerLifecycle`). Task 011 asked
+for a production scoring engine on the same observations. Changing weights,
+Laplace, confidence, latency mapping, or eligibility while keeping
+`scoring_version = v1` would silently rewrite historical snapshots. Ranking
+(D-040) reads **only** `v1`. A new version would be invisible to listings unless
+ranking changed, which this task must not do.
+
+**Decision.**
+
+1. **Formula and persistence unchanged.** D-038/D-039 remain the v1 contract.
+   No migration. `proxy_scores` still stores score, window reliabilities,
+   p50/p95, sample counts, `scoring_version`. Intermediate components
+   (`reliability_score`, `latency_score`, `confidence_score`, weighted mean
+   MTProto latency, last success, freshness) stay in-process on
+   `ScoreBreakdown`.
+2. **Latency source.** Successful `mtproto_connect_ms` only. TCP and
+   `total_latency_ms` never substitute. Timeouts stay category failures, not
+   invented milliseconds.
+3. **UNSUPPORTED_TRANSPORT / CANCELLED.** Neither is GetConfig success, so
+   neither is ranked as a working proxy. They remain `success = false`
+   observations (distinct in `failure_counts`). Excluding them from `n` would
+   fork v1. Fake-TLS therefore still scores as unverified, which is honest
+   given Telethon (D-044).
+4. **Freshness.** `RECENT` / `AGING` / `STALE` is derived from last success age
+   (< 6 h / 6–24 h / no success in lookback). Not a column. Ranking staleness
+   remains D-040 (`calculated_at` within 24 h).
+5. **Worker.** Same `WorkerLifecycle` tick, `SCORER_BATCH_SIZE`,
+   `FOR UPDATE SKIP LOCKED` claim. No network, no Telethon, no second
+   scheduler. A compute error on one proxy is logged and skipped; other
+   snapshots in the batch still insert. `CancelledError` still propagates.
+6. **Out of scope.** Telegram publishing, bot commands, Qwen, Cloudflare,
+   public ranking API changes, monetization.
+
+**Evidence.** Unit tests pin 1h/6h/24h inclusive boundaries, linear-interpolation
+percentiles, the 10×2100 ms worked example (`score = 43.594`), Fake-TLS not
+outranking a GetConfig success, and per-proxy isolation. Integration tests still
+prove append-only snapshots and immutable observations.
+
+**Consequences.** Historical v1 rows keep their meaning. Operators who want a
+different eligibility rule (drop CANCELLED from `n`) need a new
+`scoring_version` and a ranking change — not a silent v1 edit.
+
+---
+
 ## Task 010 — Tester production hardening and transport verification
 
 ### D-044 · Phase-aware probe timeouts; Fake-TLS stays unsupported; cancel releases leases

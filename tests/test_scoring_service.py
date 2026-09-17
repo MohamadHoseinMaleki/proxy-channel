@@ -9,6 +9,7 @@ import pytest
 
 from core.identity import ProxySecret
 from core.models import Proxy, utcnow
+from modules.scoring.calculator import score_observations
 from modules.scoring.models import ScoreBreakdown, ScoreStatus
 from modules.scoring.service import ScoringService
 
@@ -122,3 +123,52 @@ class TestScoringServiceUnit:
         output = json_logs.readouterr().out
         assert secret not in output
         assert "tg://" not in output
+
+    @pytest.mark.asyncio
+    async def test_one_proxy_compute_error_does_not_drop_the_rest(self) -> None:
+        mock_db = MagicMock()
+        mock_session = AsyncMock()
+        mock_session.add = MagicMock()
+
+        class DummyScope:
+            async def __aenter__(self) -> AsyncMock:
+                return mock_session
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        mock_db.session_scope.return_value = DummyScope()
+        service = ScoringService(mock_db, batch_size=5)
+        now = utcnow()
+        broken = Proxy(
+            id=1,
+            server="198.51.100.1",
+            port=443,
+            secret=ProxySecret("dd" + "11" * 16),
+            fingerprint="c" * 64,
+            last_test_finished_at=now,
+        )
+        healthy = Proxy(
+            id=2,
+            server="198.51.100.2",
+            port=443,
+            secret=ProxySecret("dd" + "22" * 16),
+            fingerprint="d" * 64,
+            last_test_finished_at=now,
+        )
+
+        def fake_score(proxy_id: int, observations: object, *, now: object) -> object:
+            if proxy_id == 1:
+                raise RuntimeError("synthetic scoring failure")
+            return score_observations(proxy_id, observations, now=now)  # type: ignore[arg-type]
+
+        with (
+            patch.object(service, "claim_due_proxies", return_value=[broken, healthy]),
+            patch.object(service, "_load_observations", return_value={1: [], 2: []}),
+            patch("modules.scoring.service.score_observations", side_effect=fake_score),
+        ):
+            results = await service.run_batch()
+
+        assert [item.proxy_id for item in results] == [2]
+        assert results[0].status is ScoreStatus.NO_OBSERVATIONS_IN_WINDOW
+        mock_session.add.assert_called_once()

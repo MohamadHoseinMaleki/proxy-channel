@@ -17,6 +17,7 @@ from core.models import SCORING_VERSION_V1
 __all__ = [
     "ObservationInput",
     "ScoreBreakdown",
+    "ScoreFreshness",
     "ScoreStatus",
 ]
 
@@ -30,6 +31,18 @@ class ScoreStatus(StrEnum):
 
     SCORED = "SCORED"
     NO_OBSERVATIONS_IN_WINDOW = "NO_OBSERVATIONS_IN_WINDOW"
+
+
+class ScoreFreshness(StrEnum):
+    """Derived last-success age. Not stored on ``proxy_scores`` (D-045).
+
+    Ranking already treats snapshots older than 24 h as ineligible (D-040).
+    This label is explainability only and does not change ``score``.
+    """
+
+    RECENT = "RECENT"  # last GetConfig success younger than 6 h
+    AGING = "AGING"  # last success in the 6-24 h lookback
+    STALE = "STALE"  # no success in the 24 h window
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +101,11 @@ class ScoreBreakdown:
     failure_counts: tuple[tuple[str, int], ...] = ()
     status: ScoreStatus = ScoreStatus.SCORED
     scoring_version: str = SCORING_VERSION_V1
+    #: Newest successful ``observed_at`` in the lookback. Not persisted.
+    last_success_at: datetime | None = None
+    #: Recency-weighted mean of successful ``mtproto_connect_ms``. Not persisted.
+    mean_mtproto_ms: Decimal | None = None
+    freshness: ScoreFreshness = ScoreFreshness.STALE
 
     def __repr__(self) -> str:
         return (

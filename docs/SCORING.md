@@ -181,9 +181,11 @@ No extra severity weights. The tester already decided success vs failure; we
 do not invent semantics the taxonomy does not support (`WRONG_SECRET` remains
 absent).
 
-`SSRF_BLOCKED`, `UNSUPPORTED_TRANSPORT`, `INVALID_SECRET` are ordinary
-failures (`success = false`). Fake-TLS stays unscored-as-working until a
-transport can actually verify it.
+`SSRF_BLOCKED`, `UNSUPPORTED_TRANSPORT`, `INVALID_SECRET`, and `CANCELLED`
+are ordinary failures (`success = false`). They are **not** GetConfig
+success, so they cannot rank as a working proxy. They stay inside `n` because
+dropping them would change v1 (D-045). Fake-TLS stays unscored-as-working
+until a transport can actually verify it.
 
 ## Persistence
 
@@ -207,19 +209,39 @@ Scoring is not a second tester scheduler. It never writes `next_test_at`,
 `proxies` may make the tester `SKIP LOCKED` those rows for milliseconds; that
 is contention, not a change to test cadence.
 
+## Freshness (derived, not stored)
+
+Explainability only. Does **not** change `score` and is **not** a
+`proxy_scores` column (D-045). Ranking freshness is still D-040
+(`calculated_at` within 24 h).
+
+| Label | Meaning |
+|---|---|
+| `RECENT` | last GetConfig success younger than 6 h |
+| `AGING` | last success in the 6–24 h lookback |
+| `STALE` | no success in the 24 h window |
+
+`mean_mtproto_ms` and `last_success_at` live on `ScoreBreakdown` for the same
+reason: recoverable from observations, not duplicated on the snapshot table.
+
 ## Worked examples (illustrative, not live measurements)
 
 These numbers are produced by the pure function on synthetic observations.
 No proxy was contacted.
 
-* **10/10 recent successes, 2100 ms.** Confidence 0.5. High reliability after
-  Laplace, strong latency score, mid-range final score — not 100, because ten
-  samples are not a long history.
+* **10/10 successes at `observed_at = now`, 2100 ms.**
+  `reliability_score = 91.667` (Laplace 11/12), `latency_score = 73.750`
+  (`1 - 2100/8000`), `confidence_factor = 0.5`, **`score = 43.594`**.
+  Mid-range because ten samples are not a long history.
 * **1/1 success.** Window reliability 100%, confidence ≈ 0.09, final score
   well below 20.
 * **0/10 failures.** Latency score 0, low reliability, small final score.
+  Freshness `STALE`.
 * **5 recent failures + 5 old successes** scores worse than the reverse,
   because of exponential decay.
+* **6× `UNSUPPORTED_TRANSPORT`.** Counted as failures, distinct in
+  `failure_counts`, never treated as verified, score below a single GetConfig
+  success. Same for `CANCELLED`: not a latency sample, not a success.
 
 ## Limitations
 

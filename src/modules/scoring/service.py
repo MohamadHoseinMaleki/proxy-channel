@@ -14,6 +14,8 @@ Architectural invariants:
    Scoring never writes ``next_test_at``, ``test_lock_until``, or
    observations — it is not a second tester scheduler.
 6. Logs carry ``proxy_id`` only — never secrets, DSNs, or ``tg://`` URLs.
+7. A compute error on one proxy is logged and skipped (D-045); other snapshots
+   in the batch still persist. ``CancelledError`` is not swallowed.
 """
 
 from __future__ import annotations
@@ -68,24 +70,27 @@ class ScoringService:
             grouped = await self._load_observations(session, proxy_ids, cutoff)
 
             results: list[ScoreBreakdown] = []
+            failed = 0
             for proxy_id in proxy_ids:
                 try:
                     breakdown = score_observations(proxy_id, grouped.get(proxy_id, ()), now=now)
-                    session.add(_to_proxy_score(breakdown))
-                    results.append(breakdown)
                 except Exception as exc:
+                    failed += 1
                     _logger.error(
                         "scorer_proxy_failed",
                         proxy_id=proxy_id,
                         error=safe_error_message(exc),
                         exception_type=type(exc).__name__,
                     )
-                    raise
+                    continue
+                session.add(_to_proxy_score(breakdown))
+                results.append(breakdown)
 
             _logger.info(
                 "scorer_batch_completed",
                 total=len(results),
                 scored=sum(1 for item in results if item.observation_count > 0),
+                failed=failed,
             )
             return results
 
