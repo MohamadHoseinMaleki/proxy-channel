@@ -27,6 +27,17 @@ from modules.publishing.backoff import (
 )
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.formatter import format_channel_message
+from modules.publishing.metrics import PublicationMetrics
+from modules.publishing.observe import (
+    EVENT_FAILED,
+    EVENT_PUBLISHED,
+    EVENT_RECOVERED,
+    EVENT_REJECTED,
+    EVENT_RETRY,
+    EVENT_TELEGRAM_RATE_LIMITED,
+    PublicationErrorClass,
+    classify_publish_result,
+)
 from modules.publishing.protocol import PublishResult, TelegramPublisher
 from modules.publishing.scheduler import (
     DEFAULT_DEDUP_SECONDS,
@@ -74,6 +85,7 @@ class PublishingService:
         channel_id: str,
         reporting: ReportingService | None = None,
         settings: Settings | None = None,
+        metrics: PublicationMetrics | None = None,
     ) -> None:
         chat = channel_id.strip()
         if not chat:
@@ -109,6 +121,7 @@ class PublishingService:
                 settings.telegram_publication_max_pending if settings else DEFAULT_MAX_PENDING
             ),
         )
+        self.metrics = metrics if metrics is not None else PublicationMetrics()
 
     async def publish_cycle(
         self,
@@ -141,15 +154,26 @@ class PublishingService:
                 eligible.append(item)
                 continue
             skipped += 1
+            self.metrics.inc_rejected()
             _logger.warning(
-                "publication_rejected",
+                EVENT_REJECTED,
                 proxy_id=item.proxy_id,
+                channel_id=self.channel_id,
                 reason=check.reason,
+                classification=PublicationErrorClass.VALIDATION,
             )
 
         async with self.db.session_scope() as session:
-            await self.scheduler.enqueue(session, eligible, now=moment)
+            scheduled = await self.scheduler.enqueue(session, eligible, now=moment)
+        if scheduled:
+            self.metrics.inc_scheduled(len(scheduled))
         recovered = await self._recover(now=moment)
+        for publication_id in recovered:
+            _logger.info(
+                EVENT_RECOVERED,
+                publication_id=publication_id,
+                channel_id=self.channel_id,
+            )
 
         claimed: list[ProxyPublication] = []
         if eligible:
@@ -247,22 +271,40 @@ class PublishingService:
         if result.ok and result.telegram_message_id is not None:
             stored = await self._mark_published(row, result.telegram_message_id)
             if stored:
+                self.metrics.inc_success()
                 _logger.info(
-                    "publication_published",
+                    EVENT_PUBLISHED,
                     proxy_id=item.proxy_id,
                     publication_id=row.id,
+                    channel_id=self.channel_id,
+                    attempt=row.attempt_count + 1,
                     telegram_message_id=result.telegram_message_id,
                 )
                 return PublicationStatus.PUBLISHED
+            self.metrics.inc_failures()
+            _logger.warning(
+                EVENT_FAILED,
+                proxy_id=item.proxy_id,
+                publication_id=row.id,
+                channel_id=self.channel_id,
+                attempt=row.attempt_count + 1,
+                reason="unique_conflict",
+                classification=PublicationErrorClass.DATABASE,
+            )
             return PublicationStatus.FAILED
 
         error = result.error_safe or "telegram_publish_failed"
+        classification = classify_publish_result(result)
         if result.error_code == 429:
+            self.metrics.inc_rate_limits()
             _logger.warning(
-                "telegram_rate_limited",
+                EVENT_TELEGRAM_RATE_LIMITED,
                 proxy_id=item.proxy_id,
                 publication_id=row.id,
+                channel_id=self.channel_id,
+                attempt=row.attempt_count + 1,
                 retry_after=result.retry_after,
+                classification=classification,
             )
         attempts_after = row.attempt_count + 1
         retryable = result.retryable and attempts_after < self.max_retries
@@ -274,22 +316,29 @@ class PublishingService:
                 retry_after=result.retry_after,
             )
             await self._schedule_retry(row, error=error, delay_seconds=delay, now=now)
+            self.metrics.inc_retries()
             _logger.info(
-                "publication_retry_scheduled",
+                EVENT_RETRY,
                 proxy_id=item.proxy_id,
                 publication_id=row.id,
+                channel_id=self.channel_id,
                 attempt=attempts_after,
                 delay_seconds=delay,
+                reason=error,
+                classification=classification,
             )
             return PublicationStatus.PENDING
 
         await self._mark_failed(row, error=error)
+        self.metrics.inc_failures()
         _logger.warning(
-            "publication_permanently_failed",
+            EVENT_FAILED,
             proxy_id=item.proxy_id,
             publication_id=row.id,
+            channel_id=self.channel_id,
             attempt=attempts_after,
-            error=error,
+            reason=error,
+            classification=classification,
         )
         return PublicationStatus.FAILED
 
@@ -313,7 +362,13 @@ class PublishingService:
                 result = await session.execute(statement)
                 return int(getattr(result, "rowcount", 0) or 0) == 1
         except IntegrityError:
-            _logger.info("publication_unique_conflict", proxy_id=row.proxy_id)
+            _logger.info(
+                "publication_unique_conflict",
+                proxy_id=row.proxy_id,
+                publication_id=row.id,
+                channel_id=self.channel_id,
+                classification=PublicationErrorClass.DATABASE,
+            )
             return False
 
     async def _schedule_retry(

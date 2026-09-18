@@ -1,6 +1,6 @@
 """SQLAlchemy 2.x async ORM models for the proxy intelligence schema.
 
-Six tables, six distinct jobs. Keeping them separate is the core of the design:
+Seven tables, seven distinct jobs. Keeping them separate is the core of the design:
 
 ======================  =========================================================
 Table                   Role
@@ -14,6 +14,7 @@ Table                   Role
                         observations
 ``proxy_publications``  **outbox** -- one row per ``(proxy_id, channel_id)``
 ``publication_schedules`` **cadence** -- one row per channel, last enqueue slot
+``publisher_heartbeats`` **liveness** -- last seen time per publisher worker
 ======================  =========================================================
 
 Nothing here performs I/O at import time. Timestamps are ``TIMESTAMPTZ`` with
@@ -81,6 +82,7 @@ __all__ = [
     "ProxyScore",
     "PublicationSchedule",
     "PublicationStatus",
+    "PublisherHeartbeat",
     "SourceType",
     "masked_secret_text",
     "utcnow",
@@ -825,4 +827,35 @@ class PublicationSchedule(Base):
         return (
             f"<PublicationSchedule channel_id={self.channel_id!r} "
             f"last_scheduled_at={self.last_scheduled_at}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PublisherHeartbeat -- worker liveness (Task 017)
+# ---------------------------------------------------------------------------
+
+
+class PublisherHeartbeat(Base):
+    """Last time a publisher process wrote a heartbeat.
+
+    Existence of a row is **not** health: :mod:`modules.publishing.health`
+    treats a missing or stale ``last_seen_at`` as unhealthy. No secrets.
+    """
+
+    __tablename__ = "publisher_heartbeats"
+    __table_args__ = (
+        CheckConstraint("char_length(worker_name) > 0", name="worker_name_not_blank"),
+    )
+
+    worker_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PublisherHeartbeat worker_name={self.worker_name!r} "
+            f"last_seen_at={self.last_seen_at}>"
         )

@@ -32,6 +32,7 @@ from core.models import (
     ProxyScore,
     PublicationSchedule,
     PublicationStatus,
+    PublisherHeartbeat,
     SecretText,
     SourceType,
     masked_secret_text,
@@ -72,6 +73,7 @@ class TestMetadata:
             "proxy_scores",
             "proxy_publications",
             "publication_schedules",
+            "publisher_heartbeats",
         }
 
     def test_no_module_level_engine_is_imported(self) -> None:
@@ -447,6 +449,35 @@ class TestPublicationSchedule:
     def test_repr_has_no_secret(self) -> None:
         rendered = repr(PublicationSchedule(channel_id="@chan"))
         assert "@chan" in rendered
+        assert "secret" not in rendered
+
+
+class TestPublisherHeartbeat:
+    def test_columns(self) -> None:
+        assert set(PublisherHeartbeat.__table__.columns.keys()) == {
+            "worker_name",
+            "last_seen_at",
+            "run_id",
+            "created_at",
+        }
+
+    def test_worker_name_is_primary_key(self) -> None:
+        column = PublisherHeartbeat.__table__.c.worker_name
+        assert column.primary_key is True
+        assert column.nullable is False
+        assert string_length(PublisherHeartbeat.__table__.c.worker_name) == 64
+
+    def test_worker_name_not_blank(self) -> None:
+        assert "char_length(worker_name) > 0" in ddl(PublisherHeartbeat.__table__)
+
+    def test_no_foreign_keys(self) -> None:
+        assert list(PublisherHeartbeat.__table__.foreign_keys) == []
+
+    def test_repr_has_no_secret(self) -> None:
+        rendered = repr(
+            PublisherHeartbeat(worker_name="publishing-worker", last_seen_at=datetime.now(UTC))
+        )
+        assert "publishing-worker" in rendered
         assert "secret" not in rendered
 
 

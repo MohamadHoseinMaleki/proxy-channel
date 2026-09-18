@@ -186,6 +186,13 @@ class Settings(BaseSettings):
     telegram_publication_dedup_seconds: float = Field(default=86400.0, ge=0, le=30 * 86400)
     #: Do not enqueue more while pending+sending is at this cap.
     telegram_publication_max_pending: int = Field(default=20, ge=1, le=500)
+    #: How often the publisher worker may write ``publisher_heartbeats``.
+    #: ``0`` disables the DB write (lifecycle log heartbeats are separate).
+    telegram_publisher_heartbeat_seconds: float = Field(default=60.0, ge=0, le=3600)
+    #: Health treats ``last_seen_at`` older than this as a stale worker.
+    telegram_publisher_heartbeat_stale_seconds: float = Field(default=180.0, gt=0, le=86400)
+    #: Health counts pending rows older than this as stuck (detection only).
+    telegram_publication_stale_pending_seconds: float = Field(default=3600.0, gt=0, le=7 * 86400)
 
     # --- HTTP ranking API (Task 007) ---------------------------------------
     #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.
@@ -279,6 +286,20 @@ class Settings(BaseSettings):
     def _check_publisher_retry_bounds(self) -> Settings:
         if self.telegram_retry_max_seconds < self.telegram_retry_base_seconds:
             msg = "telegram_retry_max_seconds must be >= telegram_retry_base_seconds"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _check_publisher_heartbeat_bounds(self) -> Settings:
+        if (
+            self.telegram_publisher_heartbeat_seconds > 0
+            and self.telegram_publisher_heartbeat_stale_seconds
+            < self.telegram_publisher_heartbeat_seconds
+        ):
+            msg = (
+                "telegram_publisher_heartbeat_stale_seconds must be >= "
+                "telegram_publisher_heartbeat_seconds"
+            )
             raise ValueError(msg)
         return self
 

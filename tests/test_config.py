@@ -506,6 +506,34 @@ class TestPublisherSettings:
         with pytest.raises(ValidationError):
             make_settings(telegram_publication_max_pending=0)
 
+    def test_observability_defaults(self) -> None:
+        settings = make_settings()
+        assert settings.telegram_publisher_heartbeat_seconds == 60.0
+        assert settings.telegram_publisher_heartbeat_stale_seconds == 180.0
+        assert settings.telegram_publication_stale_pending_seconds == 3600.0
+
+    def test_observability_overrides_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TELEGRAM_PUBLISHER_HEARTBEAT_SECONDS", "15")
+        monkeypatch.setenv("TELEGRAM_PUBLISHER_HEARTBEAT_STALE_SECONDS", "45")
+        monkeypatch.setenv("TELEGRAM_PUBLICATION_STALE_PENDING_SECONDS", "120")
+        settings = build_settings(env_file=None)
+        assert settings.telegram_publisher_heartbeat_seconds == 15.0
+        assert settings.telegram_publisher_heartbeat_stale_seconds == 45.0
+        assert settings.telegram_publication_stale_pending_seconds == 120.0
+
+    def test_zero_heartbeat_disables_writes(self) -> None:
+        settings = make_settings(telegram_publisher_heartbeat_seconds=0)
+        assert settings.telegram_publisher_heartbeat_seconds == 0.0
+
+    def test_rejects_stale_shorter_than_heartbeat(self) -> None:
+        with pytest.raises(ValidationError, match="telegram_publisher_heartbeat_stale_seconds"):
+            make_settings(
+                telegram_publisher_heartbeat_seconds=60,
+                telegram_publisher_heartbeat_stale_seconds=10,
+            )
+
 
 class TestApiBind:
     def test_defaults_to_loopback_8080(self) -> None:

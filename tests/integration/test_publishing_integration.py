@@ -539,9 +539,7 @@ async def test_failed_publication_does_not_spawn_infinite_rows(db: Database) -> 
     now = utcnow()
     proxy = await _add_proxy(db, server="1.0.0.9", secret="dd" + "bb" * 16)
     await _ready(db, proxy.id, score="60.000", now=now)
-    fail = PublishResult(
-        ok=False, telegram_message_id=None, error_safe="timeout", retryable=True
-    )
+    fail = PublishResult(ok=False, telegram_message_id=None, error_safe="timeout", retryable=True)
     publisher = FakeTelegramPublisher(results=[fail, fail])
     service = _service(
         db,

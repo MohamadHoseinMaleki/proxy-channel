@@ -19,7 +19,10 @@ import time
 
 from core.database import Database
 from core.lifecycle import WorkerLifecycle, worker_main
+from core.logger import safe_error_message
 from modules.publishing.bot_api import BotApiTelegramPublisher, TelegramPublishError
+from modules.publishing.health import touch_publisher_heartbeat
+from modules.publishing.observe import PublicationErrorClass
 from modules.publishing.service import PublishingService
 from modules.reporting.service import ReportingService
 
@@ -44,6 +47,7 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
             skipped="unconfigured",
             published=0,
             failed=0,
+            classification=PublicationErrorClass.CONFIGURATION,
             duration_ms=round((time.monotonic() - started) * 1000, 3),
         )
         return
@@ -60,8 +64,10 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
                 "publisher_tick_db_unreachable",
                 worker=WORKER_NAME,
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
+                classification=PublicationErrorClass.DATABASE,
             )
             return
+        await _touch_heartbeat(life, db)
 
         token = life.settings.telegram_bot_token
         destination = life.settings.telegram_channel_id
@@ -80,6 +86,7 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
                 implemented=True,
                 skipped="invalid_credentials",
                 error=type(exc).__name__,
+                classification=PublicationErrorClass.CONFIGURATION,
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
             )
             return
@@ -108,6 +115,27 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
             await publisher.aclose()
         if dispose_db:
             await db.dispose()
+
+
+async def _touch_heartbeat(life: WorkerLifecycle, db: Database) -> None:
+    interval = life.settings.telegram_publisher_heartbeat_seconds
+    if interval <= 0:
+        return
+    try:
+        async with db.session_scope() as session:
+            await touch_publisher_heartbeat(
+                session,
+                worker_name=WORKER_NAME,
+                run_id=life.run_id,
+                interval_seconds=interval,
+            )
+    except Exception as exc:
+        life.logger.warning(
+            "publisher_heartbeat_failed",
+            worker=WORKER_NAME,
+            error=safe_error_message(exc),
+            classification=PublicationErrorClass.DATABASE,
+        )
 
 
 def main() -> None:

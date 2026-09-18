@@ -39,6 +39,9 @@ scope. Scoring v1 and reporting selection are unchanged.
 | `TELEGRAM_PUBLICATION_INTERVAL_SECONDS` | 300 | min gap between *new* outbox inserts |
 | `TELEGRAM_PUBLICATION_DEDUP_SECONDS` | 86400 | recently published proxy is not re-enqueued |
 | `TELEGRAM_PUBLICATION_MAX_PENDING` | 20 | do not enqueue while pending+sending ≥ this |
+| `TELEGRAM_PUBLISHER_HEARTBEAT_SECONDS` | 60 | DB heartbeat write interval; `0` disables writes |
+| `TELEGRAM_PUBLISHER_HEARTBEAT_STALE_SECONDS` | 180 | health: heartbeat older than this is stale |
+| `TELEGRAM_PUBLICATION_STALE_PENDING_SECONDS` | 3600 | health: pending older than this is stuck |
 
 Neither value is hard-coded. The Bot API host is **not** configurable
 (`https://api.telegram.org` only) so a channel id cannot become an SSRF target.
@@ -181,6 +184,26 @@ The channel message body (MTProto secret) is **not** stored.
 
 `publication_schedules` (migration `0004`): `channel_id` PK,
 `last_scheduled_at`, `created_at`. No secrets, no FK.
+
+`publisher_heartbeats` (migration `0005`): `worker_name` PK, `last_seen_at`,
+optional `run_id`. A row existing is **not** health; age of `last_seen_at`
+is. Health snapshots are **read-only** and never recover, claim, or publish.
+
+## Observability
+
+Structured events (structlog): `publication_scheduled`, `publication_rejected`,
+`publication_claimed`, `publication_published`, `publication_retry`,
+`publication_failed`, `publication_recovered`, `telegram_rate_limited`.
+Context is `publication_id` / `proxy_id` / `channel_id` / `attempt` / `reason`
+plus an observability `classification` (`validation`, `telegram`, `database`,
+`configuration`, `transient`, `permanent`). Classification does **not** change
+retry (D-048).
+
+In-process counters (not Prometheus): scheduled, rejected, retries, failures,
+success, rate-limits. Gauges (pending/sending/published/failed, stale sending,
+oldest ages, last success/failure, heartbeat) come from PostgreSQL.
+
+This is **not** production-grade monitoring: there is no metrics backend.
 
 ## Secrets
 

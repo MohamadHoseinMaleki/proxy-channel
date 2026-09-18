@@ -8,6 +8,45 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 017 — Publication observability and health
+
+### D-051 · In-process counters, read-only health, DB heartbeat; no retry change
+
+**Context.** 012–016 already emit some structlog events. Lifecycle
+`worker_heartbeat` is log-only. Ranking `/healthz` is process liveness, not
+outbox health. There is no Prometheus/OTel in the stack.
+
+**Decision.**
+
+1. **Events.** Reuse structlog. Canonical names:
+   `publication_scheduled|rejected|claimed|published|retry|failed|recovered`,
+   `telegram_rate_limited`. Fields: `publication_id`, `proxy_id`, `channel_id`,
+   `attempt`, `reason`, observability `classification`. Never log bot token,
+   MTProto secret, full `tg://proxy` URI, or Authorization.
+2. **Classification is logs-only.** `validation`, `telegram`, `database`,
+   `configuration`, `transient`, `permanent`. Retry/backoff stay D-048.
+3. **Counters.** In-process totals for scheduled, rejected, retries, failures,
+   success, rate-limits. No Prometheus/OTel.
+4. **Health.** Read-only snapshot: pending/sending/published/failed counts,
+   stale sending (expired `lease_until`), old pending, oldest ages, last
+   success/failure timestamps, heartbeat age. Never schedule, enqueue, retry,
+   recover, claim, or publish.
+5. **Heartbeat.** `publisher_heartbeats` (migration `0005`). Worker id +
+   `last_seen_at`, written at most every
+   `TELEGRAM_PUBLISHER_HEARTBEAT_SECONDS` (`0` disables). A row existing is
+   not healthy; stale `last_seen_at` is.
+6. **Out of scope.** Scoring/ranking/`select_top`/validation/formatter/
+   scheduler/outbox claim-retry behaviour. Qwen, Cloudflare, public API.
+
+**Evidence.** Unit tests pin counters, classification, read-only SQL, and
+redaction. Integration tests pin snapshot no-mutate, heartbeat throttle, and
+012–016 regression with Fake Telegram.
+
+**Consequences.** Operators can see a stuck outbox without a metrics backend.
+This is not production-grade monitoring.
+
+---
+
 ## Task 016 — Publication scheduling and deduplication
 
 ### D-050 · DB cadence slot; unique identity stays; no independent selection

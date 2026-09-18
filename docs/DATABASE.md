@@ -58,8 +58,8 @@ rather than failing, so `uv run pytest` stays green everywhere.
 
 ## Schema overview
 
-Six tables, six responsibilities. They have different write rates, retention
-needs and deletion semantics, which is why they are separate (D-017, D-047, D-050).
+Seven tables, seven responsibilities. They have different write rates, retention
+needs and deletion semantics, which is why they are separate (D-017, D-047, D-050, D-051).
 
 ```
 proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
@@ -68,6 +68,7 @@ proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
           └──< proxy_publications   ON DELETE RESTRICT
 
 publication_schedules   (one row per channel; no FK)
+publisher_heartbeats    (one row per publisher worker; no FK)
 ```
 
 | Table | Role | Written by | Lifetime |
@@ -78,6 +79,7 @@ publication_schedules   (one row per channel; no FK)
 | `proxy_scores` | **derived state** — versioned snapshots | scorer | append-only history |
 | `proxy_publications` | **outbox** — one row per ``(proxy_id, channel_id)`` | publisher | lifecycle (D-048) |
 | `publication_schedules` | **cadence** — last new-insert slot per channel | publisher | D-050 |
+| `publisher_heartbeats` | **liveness** — last seen per publisher worker | publisher | D-051 |
 
 ### `proxies`
 
@@ -322,6 +324,7 @@ amplification.
 | `ix_proxy_publications_proxy_id` | `(proxy_id)` | audit by identity |
 | `ix_proxy_publications_created_at` | `(created_at)` | time-range sweeps |
 | `pk_publication_schedules` | `PRIMARY KEY (channel_id)` | publisher cadence slot |
+| `pk_publisher_heartbeats` | `PRIMARY KEY (worker_name)` | publisher liveness |
 
 Notes worth knowing before changing any of them:
 

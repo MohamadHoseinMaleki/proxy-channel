@@ -79,6 +79,7 @@ _TEST_URL = _resolve_test_url()
 #: Tables truncated between tests. Listed explicitly rather than discovered so a
 #: new table cannot quietly escape isolation.
 TABLES = (
+    "publisher_heartbeats",
     "publication_schedules",
     "proxy_publications",
     "proxy_scores",
