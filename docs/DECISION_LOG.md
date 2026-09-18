@@ -8,6 +8,46 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 015 — Publication quality and channel formatting
+
+### D-049 · Validate then format; do not rescore; secret only in the canonical URL
+
+**Context.** Task 013/014 post `select_top` items with a labeled `secret:`
+field and only a Fake-TLS guard. Channel text is user-facing: it must stay
+short, deterministic, free of internal identifiers, and resistant to markup
+injection, without inventing country/location the schema does not store.
+
+**Decision.**
+
+1. **`select_top` remains the only selection source.** Formatter and
+   validator do not rank, score, or add proxies.
+2. **Independent layers.** `validate_publication` then
+   `PublicationFormatter.format`. Publisher posts the string; it does not
+   invent business copy. Outbox claim/lease/retry (D-048) is unchanged.
+3. **Validation.** Host/port/secret reuse discovery normalisers. Protocol
+   must be `mtproto`. Fake-TLS is `INVALID` (`fake_tls`). A canonical
+   `tg://proxy` must be producible and parseable. Reasons are stable codes
+   (`invalid_port`, `invalid_host`, `invalid_protocol`, `invalid_secret`,
+   `fake_tls`, `malformed_proxy`). Invalid items are not enqueued and
+   Telegram is not called.
+4. **Message.** Plaintext, no `parse_mode`. Fields: proxy, protocol,
+   status (freshness), last checked, quality. Optional metrics omitted when
+   null. Country omitted (not in DB). Secret is not a labeled line; it
+   appears only on the last-line canonical URL. Markup/control characters
+   are stripped from display fields. Length ≤ 4096 by dropping optional
+   lines first; the URL is never dropped.
+5. **No migration.**
+
+**Evidence.** Unit tests cover determinism, rejection codes, escaping,
+length, and secret confinement to the last line. Integration tests prove a
+forged Fake-TLS / loopback item does not produce a Telegram call while a
+valid `select_top` item still does.
+
+**Consequences.** Channel posts still contain the secret inside `tg://`
+because users cannot connect without it. Logs still must not.
+
+---
+
 ## Task 014 — Telegram publishing reliability
 
 ### D-048 · Outbox lifecycle, leased claim, honest at-least-once

@@ -8,7 +8,11 @@ calls `ReportingService.select_top` (Task 012 / D-046) and publishes that list.
 ```
 ReportingService.select_top
         ↓
-PublishingService.publish_cycle
+validate_publication
+        ↓
+PublicationFormatter
+        ↓
+PublishingService (outbox claim / send)
         ↓
 TelegramPublisher.publish(message)
         ↓
@@ -49,26 +53,47 @@ They never call Telegram.
 
 ## Message format
 
-Deterministic plain text. Same `ReportItem` → same string.
+Deterministic plain text (Task 015 / D-049). Same `ReportItem` → same string.
+No `parse_mode`. External fields are stripped of control characters and
+markup. Country/location is **omitted** — the schema does not store it.
 
 ```
 MTProto proxy
-server: 1.1.1.1
-port: 443
-secret: dd…
-score: 85.000
+proxy: 1.1.1.1:443
+protocol: mtproto
+status: RECENT
+last_checked: 2026-09-16T11:30:00+00:00
+quality: score 85.000
 reliability_24h: 90.00
 sample_count_24h: 10
 latency_p50_ms: 2100.000
-freshness: RECENT
 secret_type: dd
 
 tg://proxy?server=1.1.1.1&port=443&secret=dd…
 ```
 
-The last line is the Task 012 canonical URL. No HTML `parse_mode` (server
-strings must not become markup). Fake-TLS identities are refused even if a
-caller forges a `Report`.
+The last line is the canonical URL and is never dropped. Missing optional
+metrics are omitted, not invented. The MTProto secret is **not** a labeled
+field; it appears only inside `tg://proxy?...` (users need it to connect).
+Internal ids, fingerprints, bot tokens, and error traces never appear.
+
+Telegram `sendMessage` is capped at 4096 characters. Optional quality lines
+are dropped from the bottom until the message fits; the URL stays.
+
+## Pre-publication validation
+
+`validate_publication` runs **after** `select_top` and **before** enqueue/send.
+It does not change scoring, ranking, or selection. Invalid items are logged
+(`publication_rejected`, `reason=…`) and never posted.
+
+| Reason | Meaning |
+|---|---|
+| `invalid_port` | not an integer in 1..65535 |
+| `invalid_host` | empty, private, loopback, or not a public host |
+| `invalid_protocol` | not `mtproto` |
+| `invalid_secret` | not a legacy/`dd` MTProto secret |
+| `fake_tls` | `ee` / Fake-TLS (Telethon cannot verify it) |
+| `malformed_proxy` | cannot build or parse a canonical `tg://proxy` |
 
 ## Duplicate protection
 

@@ -15,7 +15,7 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–014 complete
+## ⚠️ Current status: Tasks 001–015 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
@@ -48,7 +48,8 @@ scores are computed from persisted (often synthetic) observations. See
 | 012 | Reporting & selection (publishable top-N, JSON/TXT) | ✅ **complete** |
 | 013 | Telegram channel publishing (Bot API, duplicate-safe) | ✅ **complete** |
 | 014 | Telegram publishing reliability (outbox, crash recovery) | ✅ **complete** |
-| 015–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
+| 015 | Publication validation and channel formatting | ✅ **complete** |
+| 016–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
 ---
 

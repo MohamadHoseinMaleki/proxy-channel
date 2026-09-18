@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import func, select
 
 from core.database import Database
+from core.identity import PROTOCOL_MTPROTO, ProxySecret, compute_fingerprint
 from core.models import (
     SCORING_VERSION_V1,
     Proxy,
@@ -19,11 +20,16 @@ from core.models import (
     PublicationStatus,
     utcnow,
 )
+from modules.discovery.models import SecretType
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.fake import FakeTelegramPublisher
 from modules.publishing.protocol import PublishResult
 from modules.publishing.service import PublishingService
+from modules.publishing.validation import PublicationRejection
+from modules.reporting.models import Report, ReportItem
 from modules.reporting.service import ReportingService
+from modules.reporting.urls import canonical_tg_proxy_url
+from modules.scoring.models import ScoreFreshness
 from tests.conftest import make_settings
 from tests.integration.conftest import make_proxy
 
@@ -375,6 +381,92 @@ async def test_logs_do_not_include_secrets(
     assert "tg://" not in output
     token = "123456789:AATestTokenNotARealSecretValue"
     assert token not in output
+
+
+@pytest.mark.asyncio
+async def test_invalid_and_fake_tls_never_call_telegram(db: Database) -> None:
+    now = utcnow()
+    proxy = await _add_proxy(db, server="1.1.1.1", secret="dd" + "ab" * 16)
+    await _ready(db, proxy.id, score="90.000", now=now)
+    publisher = FakeTelegramPublisher()
+    service = _service(db, publisher)
+    selected = await service.reporting.select_top(limit=10, as_of=now)
+    assert len(selected.items) == 1
+    original = selected.items[0]
+    fake_tls = ReportItem(
+        proxy_id=original.proxy_id + 9000,
+        server="8.8.8.8",
+        port=443,
+        secret=ProxySecret("ee" + "11" * 16),
+        protocol=PROTOCOL_MTPROTO,
+        secret_type=SecretType.FAKE_TLS.value,
+        fingerprint=compute_fingerprint(server="8.8.8.8", port=443, secret="ee" + "11" * 16),
+        score=original.score,
+        scoring_version=SCORING_VERSION_V1,
+        reliability_24h=original.reliability_24h,
+        sample_count_24h=original.sample_count_24h,
+        latency_p50_ms=original.latency_p50_ms,
+        latency_p95_ms=original.latency_p95_ms,
+        last_success_at=original.last_success_at,
+        freshness=ScoreFreshness.RECENT,
+        url=canonical_tg_proxy_url(server="8.8.8.8", port=443, secret="ee" + "11" * 16),
+    )
+    bad_host = ReportItem(
+        proxy_id=original.proxy_id + 9001,
+        server="127.0.0.1",
+        port=443,
+        secret=ProxySecret("dd" + "22" * 16),
+        protocol=PROTOCOL_MTPROTO,
+        secret_type=SecretType.SECURE_RANDOMIZED.value,
+        fingerprint=compute_fingerprint(server="127.0.0.1", port=443, secret="dd" + "22" * 16),
+        score=original.score,
+        scoring_version=SCORING_VERSION_V1,
+        reliability_24h=original.reliability_24h,
+        sample_count_24h=original.sample_count_24h,
+        latency_p50_ms=original.latency_p50_ms,
+        latency_p95_ms=original.latency_p95_ms,
+        last_success_at=original.last_success_at,
+        freshness=ScoreFreshness.RECENT,
+        url=canonical_tg_proxy_url(server="1.1.1.1", port=443, secret="dd" + "22" * 16),
+    )
+    mixed = Report(
+        items=(fake_tls, original, bad_host),
+        generated_at=selected.generated_at,
+        limit=selected.limit,
+        max_success_age_hours=selected.max_success_age_hours,
+        scoring_version=selected.scoring_version,
+    )
+    result = await service.publish_report(mixed, now=now)
+    assert result.published == 1
+    assert result.skipped >= 2
+    assert len(publisher.messages) == 1
+    assert "1.1.1.1" in publisher.messages[0]
+    assert publisher.messages[0].splitlines()[-1].startswith("tg://proxy?")
+    assert PublicationRejection.FAKE_TLS.value == "fake_tls"
+
+
+@pytest.mark.asyncio
+async def test_select_top_item_is_not_mutated(db: Database) -> None:
+    now = utcnow()
+    proxy = await _add_proxy(db, server="8.8.4.4", secret="dd" + "99" * 16)
+    await _ready(db, proxy.id, score="41.000", now=now)
+    service = _service(db, FakeTelegramPublisher())
+    before = await service.reporting.select_top(limit=5, as_of=now)
+    snapshot = (
+        before.items[0].proxy_id,
+        before.items[0].server,
+        before.items[0].port,
+        before.items[0].score,
+        before.items[0].url,
+    )
+    await service.publish_report(before, now=now)
+    assert (
+        before.items[0].proxy_id,
+        before.items[0].server,
+        before.items[0].port,
+        before.items[0].score,
+        before.items[0].url,
+    ) == snapshot
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,6 @@ from core.config import Settings
 from core.database import Database
 from core.logger import get_logger, safe_error_message
 from core.models import ProxyPublication, PublicationStatus, utcnow
-from modules.discovery.models import SecretType
 from modules.publishing.backoff import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MAX_RETRIES,
@@ -26,8 +25,9 @@ from modules.publishing.backoff import (
     retry_delay_seconds,
 )
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
-from modules.publishing.message import format_channel_message
+from modules.publishing.formatter import format_channel_message
 from modules.publishing.protocol import PublishResult, TelegramPublisher
+from modules.publishing.validation import validate_publication
 from modules.reporting.models import Report, ReportItem
 from modules.reporting.service import ReportingService
 
@@ -112,11 +112,19 @@ class PublishingService:
             raise ValueError(msg)
 
         items_by_id = {item.proxy_id: item for item in report.items}
-        eligible = [item for item in report.items if _is_safe_to_post(item)]
-        skipped = len(report.items) - len(eligible)
+        eligible: list[ReportItem] = []
+        skipped = 0
         for item in report.items:
-            if item.proxy_id not in {entry.proxy_id for entry in eligible}:
-                _logger.warning("publication_skipped_unpublishable", proxy_id=item.proxy_id)
+            check = validate_publication(item)
+            if check.ok:
+                eligible.append(item)
+                continue
+            skipped += 1
+            _logger.warning(
+                "publication_rejected",
+                proxy_id=item.proxy_id,
+                reason=check.reason,
+            )
 
         await self._enqueue(eligible, now=moment)
         recovered = await self._recover(now=moment)
@@ -138,7 +146,7 @@ class PublishingService:
         retried = 0
         for row in claimed:
             claimed_item = items_by_id.get(row.proxy_id)
-            if claimed_item is None or not _is_safe_to_post(claimed_item):
+            if claimed_item is None or not validate_publication(claimed_item).ok:
                 await self._release_unsendable(row, now=moment)
                 skipped += 1
                 continue
@@ -345,11 +353,3 @@ class PublishingService:
         )
         async with self.db.session_scope() as session:
             await session.execute(statement)
-
-
-def _is_safe_to_post(item: ReportItem) -> bool:
-    """Defence in depth: never post Fake-TLS even if a caller forged a Report."""
-    return item.secret_type in {
-        SecretType.LEGACY.value,
-        SecretType.SECURE_RANDOMIZED.value,
-    }

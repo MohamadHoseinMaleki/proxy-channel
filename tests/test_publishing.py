@@ -104,19 +104,24 @@ class TestMessageFormat:
         second = format_channel_message(item)
         assert first == second
         assert first.splitlines()[0] == "MTProto proxy"
-        assert "server: 8.8.8.8" in first
+        assert "proxy: 8.8.8.8:443" in first
         assert first.splitlines()[-1].startswith("tg://proxy?")
 
-    def test_missing_optional_metrics_render_as_dash(self) -> None:
+    def test_missing_optional_metrics_are_omitted(self) -> None:
         item = _item(1, reliability=None, latency_p50=None)
         text = format_channel_message(item)
-        assert "reliability_24h: -" in text
-        assert "latency_p50_ms: -" in text
+        assert "reliability_24h:" not in text
+        assert "latency_p50_ms:" not in text
+        assert "quality: score 85.000" in text
 
-    def test_repr_of_item_does_not_include_secret(self) -> None:
+    def test_secret_is_only_in_the_canonical_url(self) -> None:
         item = _item(1)
         assert DD_SECRET not in repr(item)
-        assert DD_SECRET in format_channel_message(item)
+        text = format_channel_message(item)
+        body, _, last = text.rpartition("\n")
+        assert DD_SECRET not in body
+        assert last.startswith("tg://proxy?")
+        assert DD_SECRET in last
 
 
 class TestBackoff:
