@@ -26,6 +26,10 @@ scope. Scoring v1 and reporting selection are unchanged.
 | `TELEGRAM_CHANNEL_ID` | *(unset)* | `@channel` or numeric chat id. Required with the token |
 | `PUBLISHER_TIMEOUT_SECONDS` | 15 | HTTP read/write timeout |
 | `PUBLISHER_CONNECT_TIMEOUT_SECONDS` | 5 | TCP connect timeout |
+| `TELEGRAM_PUBLICATION_LEASE_SECONDS` | 60 | stale `sending` recovery |
+| `TELEGRAM_MAX_RETRIES` | 8 | send attempts before `failed` |
+| `TELEGRAM_RETRY_BASE_SECONDS` | 2 | exponential base |
+| `TELEGRAM_RETRY_MAX_SECONDS` | 300 | backoff cap |
 
 Neither value is hard-coded. The Bot API host is **not** configurable
 (`https://api.telegram.org` only) so a channel id cannot become an SSRF target.
@@ -68,27 +72,69 @@ caller forges a `Report`.
 
 ## Duplicate protection
 
-A **successful** post is unique per `(proxy_id, channel_id)`
-(`uq_proxy_publications_success`). Re-running the worker does not send the
-same proxy again.
+One outbox row per `(proxy_id, channel_id)`
+(`uq_proxy_publications_proxy_channel`). Re-running the worker does not
+enqueue a second row. Only `pending` rows whose lease is free are claimed
+(`FOR UPDATE SKIP LOCKED`).
 
-A **failure** is appended and **may** be retried on a later tick if the proxy
-is still selected. One tick never retries the same item after a failure.
+## Telegram Publishing Reliability
 
-Telegram I/O is outside a database transaction. Each attempt is committed
-before the next send, so one failure cannot roll back earlier successes.
+Lifecycle (migration `0003`, D-048):
+
+```
+pending  →  sending  →  published
+                ↓
+            pending     (transient error, next_attempt_at)
+                ↓
+            failed      (permanent error or retries exhausted)
+```
+
+A crashed worker leaves `sending` with `lease_until`. The next tick
+**recovers** stale sending rows to `pending` and may claim them again.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `TELEGRAM_PUBLICATION_LEASE_SECONDS` | 60 | Must exceed Bot API timeout |
+| `TELEGRAM_MAX_RETRIES` | 8 | Send attempts before `failed` |
+| `TELEGRAM_RETRY_BASE_SECONDS` | 2 | Exponential base |
+| `TELEGRAM_RETRY_MAX_SECONDS` | 300 | Cap |
+
+Retry delay is `min(base * 2**(attempt-1), max)`, then at least Telegram
+`parameters.retry_after` or the `Retry-After` header. The worker does **not**
+sleep; `next_attempt_at` defers the row until a later tick.
+
+Transient: timeout, connect error, HTTP 429, HTTP 5xx, malformed Telegram
+JSON. Permanent: HTTP 400/401/403/404, empty message, Fake-TLS (never
+enqueued).
+
+### Duplicate semantics / exactly-once limitation
+
+Telegram Bot API `sendMessage` has **no idempotency key**. Delivery is
+**at-least-once internally**:
+
+| Window | Behaviour |
+|---|---|
+| Crash before HTTP | lease expires → resend. No Telegram duplicate. |
+| Crash after Telegram accepted, before `published` commit | recovery resends. **One duplicate Telegram message is possible.** |
+| After `published` commits | unique row, no further send. |
+
+Do not claim exactly-once delivery to Telegram.
 
 ## Audit table
 
-`proxy_publications` (migration `0002`):
+`proxy_publications`:
 
 | Column | Notes |
 |---|---|
 | `proxy_id` | FK, `ON DELETE RESTRICT` |
 | `channel_id` | destination, not a secret |
-| `status` | `success` or `failure` |
-| `telegram_message_id` | required on success |
-| `error_message_safe` | required on failure; scrubbed, ≤500 chars |
+| `status` | `pending` / `sending` / `published` / `failed` |
+| `telegram_message_id` | required on `published` |
+| `error_message_safe` | last error; required on `failed` |
+| `attempt_count` | send attempts |
+| `last_attempt_at` | last claim/send |
+| `next_attempt_at` | when a `pending` row is due |
+| `lease_until` | required on `sending` |
 | `created_at` | `TIMESTAMPTZ` |
 
 The channel message body (MTProto secret) is **not** stored.
@@ -101,7 +147,5 @@ The channel message body (MTProto secret) is **not** stored.
 
 ## Limitations
 
-* Crash after Telegram accepted a message but before the audit row commits can
-  produce one duplicate post. The unique success index then stops further repeats.
 * Fake-TLS is never posted (Telethon cannot verify it, D-044).
 * This is not a content bot: no Qwen, no captions beyond the standard template.

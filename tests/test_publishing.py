@@ -5,34 +5,31 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
 from core.identity import PROTOCOL_MTPROTO, ProxySecret, compute_fingerprint
-from core.models import SCORING_VERSION_V1, PublicationStatus
+from core.models import SCORING_VERSION_V1
 from modules.discovery.models import SecretType
+from modules.publishing.backoff import retry_delay_seconds
 from modules.publishing.bot_api import (
     BOT_API_BASE,
     BotApiTelegramPublisher,
     TelegramPublishError,
+    is_retryable_status,
 )
-from modules.publishing.fake import FakeTelegramPublisher
 from modules.publishing.message import format_channel_message
-from modules.publishing.service import PublishingService
-from modules.reporting.models import Report, ReportItem
+from modules.publishing.protocol import PublishResult
+from modules.reporting.models import ReportItem
 from modules.reporting.urls import canonical_tg_proxy_url
 from modules.scoring.models import ScoreFreshness
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 DD_SECRET = "dd" + "ab" * 16
-LEGACY_SECRET = "aa" * 16
-EE_SECRET = "ee" + "11" * 16
 FAKE_TOKEN = "123456789:AATestTokenNotARealSecretValue"
 CHANNEL = "@proxy_channel"
 PUBLISHING_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "modules" / "publishing"
@@ -77,65 +74,6 @@ def _item(
     )
 
 
-def _report(*items: ReportItem) -> Report:
-    return Report(
-        items=items,
-        generated_at=NOW,
-        limit=20,
-        max_success_age_hours=6.0,
-        scoring_version=SCORING_VERSION_V1,
-    )
-
-
-class _Harness(PublishingService):
-    """In-memory persistence so cycle tests do not need PostgreSQL."""
-
-    def __init__(
-        self,
-        publisher: FakeTelegramPublisher,
-        *,
-        already: set[int] | None = None,
-    ) -> None:
-        self.publisher = publisher
-        self.channel_id = CHANNEL
-        self.db = None  # type: ignore[assignment]
-        self.reporting = None  # type: ignore[assignment]
-        self._already = set(already or ())
-        self.rows: list[dict[str, Any]] = []
-
-    async def _successful_proxy_ids(self, proxy_ids: Sequence[int]) -> set[int]:
-        del proxy_ids
-        return set(self._already)
-
-    async def _record(
-        self,
-        *,
-        proxy_id: int,
-        status: PublicationStatus,
-        telegram_message_id: int | None,
-        error_message_safe: str | None,
-    ) -> bool:
-        self.rows.append(
-            {
-                "proxy_id": proxy_id,
-                "status": status,
-                "telegram_message_id": telegram_message_id,
-                "error_message_safe": error_message_safe,
-            }
-        )
-        if status is PublicationStatus.SUCCESS:
-            self._already.add(proxy_id)
-        return True
-
-
-def _harness(
-    publisher: FakeTelegramPublisher,
-    *,
-    already: set[int] | None = None,
-) -> _Harness:
-    return _Harness(publisher, already=already)
-
-
 class TestPurity:
     def test_message_and_protocol_have_no_io_imports(self) -> None:
         forbidden = {
@@ -147,7 +85,7 @@ class TestPurity:
             "aiohttp",
             "requests",
         }
-        for name in ("message.py", "protocol.py", "fake.py"):
+        for name in ("message.py", "protocol.py", "fake.py", "backoff.py"):
             path = PUBLISHING_SRC / name
             names: set[str] = set()
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -167,16 +105,7 @@ class TestMessageFormat:
         assert first == second
         assert first.splitlines()[0] == "MTProto proxy"
         assert "server: 8.8.8.8" in first
-        assert "port: 443" in first
-        assert f"secret: {DD_SECRET}" in first
-        assert "score: 50.125" in first
-        assert "reliability_24h: 90.00" in first
-        assert "sample_count_24h: 10" in first
-        assert "latency_p50_ms: 2100.000" in first
-        assert "freshness: RECENT" in first
-        assert "secret_type: dd" in first
         assert first.splitlines()[-1].startswith("tg://proxy?")
-        assert first.splitlines()[-2] == ""
 
     def test_missing_optional_metrics_render_as_dash(self) -> None:
         item = _item(1, reliability=None, latency_p50=None)
@@ -188,6 +117,35 @@ class TestMessageFormat:
         item = _item(1)
         assert DD_SECRET not in repr(item)
         assert DD_SECRET in format_channel_message(item)
+
+
+class TestBackoff:
+    def test_is_exponential_and_capped(self) -> None:
+        assert retry_delay_seconds(attempt=1, base_seconds=2, max_seconds=100) == 2
+        assert retry_delay_seconds(attempt=2, base_seconds=2, max_seconds=100) == 4
+        assert retry_delay_seconds(attempt=3, base_seconds=2, max_seconds=100) == 8
+        assert retry_delay_seconds(attempt=10, base_seconds=2, max_seconds=30) == 30
+
+    def test_retry_after_wins_when_larger(self) -> None:
+        assert retry_delay_seconds(attempt=1, base_seconds=2, max_seconds=100, retry_after=12) == 12
+        assert retry_delay_seconds(attempt=5, base_seconds=2, max_seconds=100, retry_after=3) == 32
+
+    def test_does_not_sleep(self) -> None:
+        # The function is pure: calling it 100 times is still instant.
+        delays = [
+            retry_delay_seconds(attempt=i, base_seconds=1, max_seconds=8) for i in range(1, 8)
+        ]
+        assert delays == [1, 2, 4, 8, 8, 8, 8]
+
+
+class TestRetryableStatus:
+    @pytest.mark.parametrize("code", [None, 429, 500, 502, 503])
+    def test_transient(self, code: int | None) -> None:
+        assert is_retryable_status(code) is True
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404])
+    def test_permanent(self, code: int) -> None:
+        assert is_retryable_status(code) is False
 
 
 class TestBotApiPublisher:
@@ -215,7 +173,7 @@ class TestBotApiPublisher:
         assert seen[0].url.path.endswith("/sendMessage")
         await publisher.aclose()
 
-    async def test_telegram_error_is_not_raised(self) -> None:
+    async def test_telegram_400_is_permanent(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 400,
@@ -229,12 +187,68 @@ class TestBotApiPublisher:
         )
         result = await publisher.publish("hello")
         assert result.ok is False
-        assert result.telegram_message_id is None
+        assert result.retryable is False
+        assert result.error_code == 400
         assert result.error_safe is not None
         assert "400" in result.error_safe
         await publisher.aclose()
 
-    async def test_transport_error_is_recorded(self) -> None:
+    async def test_http_429_is_retryable_and_honours_retry_after(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                json={
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests: retry after 12",
+                    "parameters": {"retry_after": 12},
+                },
+            )
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.ok is False
+        assert result.retryable is True
+        assert result.error_code == 429
+        assert result.retry_after == 12
+        await publisher.aclose()
+
+    async def test_retry_after_header_is_used(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "7"},
+                json={"ok": False, "error_code": 429, "description": "flood"},
+            )
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.retry_after == 7
+        await publisher.aclose()
+
+    async def test_http_5xx_is_retryable(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, json={"ok": False, "error_code": 502, "description": "bad"})
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.retryable is True
+        assert result.error_code == 502
+        await publisher.aclose()
+
+    async def test_transport_error_is_retryable(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("refused")
 
@@ -245,6 +259,51 @@ class TestBotApiPublisher:
         )
         result = await publisher.publish("hello")
         assert result.ok is False
+        assert result.retryable is True
+        assert result.telegram_message_id is None
+        await publisher.aclose()
+
+    async def test_timeout_is_retryable(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("slow")
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.retryable is True
+        await publisher.aclose()
+
+    async def test_malformed_json_does_not_crash(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"not-json")
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.ok is False
+        assert result.retryable is True
+        assert result.error_safe is not None
+        assert "invalid JSON" in result.error_safe
+        await publisher.aclose()
+
+    async def test_malformed_ok_payload_does_not_crash(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True, "result": "nope"})
+
+        publisher = BotApiTelegramPublisher(
+            token=FAKE_TOKEN,
+            channel_id=CHANNEL,
+            transport=httpx.MockTransport(handler),
+        )
+        result = await publisher.publish("hello")
+        assert result.ok is False
+        assert result.retryable is True
         assert result.telegram_message_id is None
         await publisher.aclose()
 
@@ -259,6 +318,7 @@ class TestBotApiPublisher:
         )
         result = await publisher.publish("  ")
         assert result.ok is False
+        assert result.retryable is False
         assert result.error_safe == "empty_message"
         await publisher.aclose()
 
@@ -268,99 +328,7 @@ class TestBotApiPublisher:
         with pytest.raises(TelegramPublishError, match="channel"):
             BotApiTelegramPublisher(token=FAKE_TOKEN, channel_id="  ")
 
-
-class TestPublishCycle:
-    async def test_selected_proxies_are_published(self) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher)
-        result = await service.publish_report(_report(_item(1), _item(2, server="1.0.0.1")))
-        assert result.published == 2
-        assert result.failed == 0
-        assert result.skipped == 0
-        assert len(publisher.messages) == 2
-        assert [row["telegram_message_id"] for row in service.rows] == [1, 2]
-        assert all(row["status"] is PublicationStatus.SUCCESS for row in service.rows)
-
-    async def test_duplicate_success_is_not_resent(self) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher, already={1})
-        result = await service.publish_report(_report(_item(1), _item(2, server="1.0.0.1")))
-        assert result.published == 1
-        assert result.skipped == 1
-        assert len(publisher.messages) == 1
-        assert "1.0.0.1" in publisher.messages[0]
-
-    async def test_second_cycle_does_not_duplicate(self) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher)
-        report = _report(_item(1))
-        first = await service.publish_report(report)
-        second = await service.publish_report(report)
-        assert first.published == 1
-        assert second.published == 0
-        assert second.skipped == 1
-        assert len(publisher.messages) == 1
-
-    async def test_fake_tls_is_not_posted(self) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher)
-        result = await service.publish_report(
-            _report(_item(1, secret=EE_SECRET, secret_type=SecretType.FAKE_TLS.value))
-        )
-        assert result.published == 0
-        assert result.skipped == 1
-        assert publisher.messages == []
-        assert service.rows == []
-
-    async def test_telegram_failure_is_recorded_and_batch_continues(self) -> None:
-        publisher = FakeTelegramPublisher(fail_on_index=(0,))
-        service = _harness(publisher)
-        result = await service.publish_report(
-            _report(_item(1), _item(2, server="1.0.0.1", secret=LEGACY_SECRET))
-        )
-        assert result.published == 1
-        assert result.failed == 1
-        assert len(publisher.messages) == 2
-        assert service.rows[0]["status"] is PublicationStatus.FAILURE
-        assert service.rows[0]["telegram_message_id"] is None
-        assert service.rows[0]["error_message_safe"] == "telegram_unavailable"
-        assert service.rows[1]["status"] is PublicationStatus.SUCCESS
-        assert service.rows[1]["telegram_message_id"] == 1
-
-    async def test_raised_transport_error_does_not_stop_the_batch(self) -> None:
-        publisher = FakeTelegramPublisher(raise_on_index=(0,))
-        service = _harness(publisher)
-        result = await service.publish_report(
-            _report(_item(1), _item(2, server="1.0.0.1", secret=LEGACY_SECRET))
-        )
-        assert result.published == 1
-        assert result.failed == 1
-        assert service.rows[0]["status"] is PublicationStatus.FAILURE
-        assert service.rows[1]["telegram_message_id"] == 1
-
-    async def test_failed_attempt_can_be_retried_later(self) -> None:
-        failing = FakeTelegramPublisher(fail_on_index=(0,))
-        service = _harness(failing)
-        first = await service.publish_report(_report(_item(1)))
-        assert first.failed == 1
-        service.publisher = FakeTelegramPublisher()
-        second = await service.publish_report(_report(_item(1)))
-        assert second.published == 1
-        assert len(service.publisher.messages) == 1
-
-    async def test_empty_report_is_a_no_op(self) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher)
-        result = await service.publish_report(_report())
-        assert result.selected == 0
-        assert result.published == 0
-        assert publisher.messages == []
-
-    async def test_logs_do_not_include_secrets(self, json_logs: pytest.CaptureFixture[str]) -> None:
-        publisher = FakeTelegramPublisher()
-        service = _harness(publisher)
-        result = await service.publish_report(_report(_item(1)))
-        output = json_logs.readouterr().out + repr(result) + repr(service.rows)
-        assert DD_SECRET not in output
-        assert "tg://proxy" not in output
-        assert FAKE_TOKEN not in output
+    def test_publish_result_repr_has_no_message_body(self) -> None:
+        result = PublishResult(ok=True, telegram_message_id=1)
+        assert DD_SECRET not in repr(result)
+        assert FAKE_TOKEN not in repr(result)

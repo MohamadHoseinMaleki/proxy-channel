@@ -15,7 +15,7 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–013 complete
+## ⚠️ Current status: Tasks 001–014 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
@@ -47,7 +47,8 @@ scores are computed from persisted (often synthetic) observations. See
 | 011 | Production scoring engine (v1 formula, append-only snapshots) | ✅ **complete** |
 | 012 | Reporting & selection (publishable top-N, JSON/TXT) | ✅ **complete** |
 | 013 | Telegram channel publishing (Bot API, duplicate-safe) | ✅ **complete** |
-| 014–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
+| 014 | Telegram publishing reliability (outbox, crash recovery) | ✅ **complete** |
+| 015–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
 ---
 
@@ -229,6 +230,9 @@ case-insensitive and a `.env` file is read automatically.
 
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL_ID` | *(unset)* | publisher idle until both are set |
 | `PUBLISHER_TIMEOUT_SECONDS`, `PUBLISHER_CONNECT_TIMEOUT_SECONDS` | `15`, `5` | Bot API HTTP bounds |
+| `TELEGRAM_PUBLICATION_LEASE_SECONDS` | `60` | stale `sending` recovery |
+| `TELEGRAM_MAX_RETRIES` | `8` | send attempts before `failed` |
+| `TELEGRAM_RETRY_BASE_SECONDS`, `TELEGRAM_RETRY_MAX_SECONDS` | `2`, `300` | exponential backoff cap |
 
 Qwen credentials are **not** defined yet.
 

@@ -99,6 +99,8 @@ async def tick(life: WorkerLifecycle, *, db: Database | None = None) -> None:
             published=result.published,
             skipped=result.skipped,
             failed=result.failed,
+            recovered=result.recovered,
+            retried=result.retried,
             duration_ms=round((time.monotonic() - started) * 1000, 3),
         )
     finally:

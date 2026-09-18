@@ -457,6 +457,28 @@ class TestPublisherSettings:
         with pytest.raises(ValidationError):
             make_settings(publisher_timeout_seconds=0)
 
+    def test_retry_defaults(self) -> None:
+        settings = make_settings()
+        assert settings.telegram_publication_lease_seconds == 60.0
+        assert settings.telegram_max_retries == 8
+        assert settings.telegram_retry_base_seconds == 2.0
+        assert settings.telegram_retry_max_seconds == 300.0
+
+    def test_retry_overrides_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TELEGRAM_PUBLICATION_LEASE_SECONDS", "45")
+        monkeypatch.setenv("TELEGRAM_MAX_RETRIES", "3")
+        monkeypatch.setenv("TELEGRAM_RETRY_BASE_SECONDS", "1")
+        monkeypatch.setenv("TELEGRAM_RETRY_MAX_SECONDS", "10")
+        settings = build_settings(env_file=None)
+        assert settings.telegram_publication_lease_seconds == 45.0
+        assert settings.telegram_max_retries == 3
+        assert settings.telegram_retry_base_seconds == 1.0
+        assert settings.telegram_retry_max_seconds == 10.0
+
+    def test_rejects_inverted_retry_bounds(self) -> None:
+        with pytest.raises(ValidationError, match="telegram_retry_max_seconds"):
+            make_settings(telegram_retry_base_seconds=30, telegram_retry_max_seconds=5)
+
 
 class TestApiBind:
     def test_defaults_to_loopback_8080(self) -> None:

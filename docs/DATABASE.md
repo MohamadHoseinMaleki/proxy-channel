@@ -74,7 +74,7 @@ proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
 | `proxy_discoveries` | **provenance** — where/when an identity was sighted | discovery | append-only |
 | `proxy_observations` | **measured behaviour** — one row per test attempt | tester | append-only; the asset |
 | `proxy_scores` | **derived state** — versioned snapshots | scorer | append-only history |
-| `proxy_publications` | **audit** — one row per Telegram publish attempt | publisher | append-only |
+| `proxy_publications` | **outbox** — one row per ``(proxy_id, channel_id)`` | publisher | lifecycle (D-048) |
 
 ### `proxies`
 
@@ -313,7 +313,9 @@ amplification.
 | `ix_proxy_observations_success_observed_at` | `(observed_at) WHERE success` | latency aggregation |
 | `ix_proxy_scores_proxy_id_calculated_at` | `(proxy_id, calculated_at)` | latest score per proxy |
 | `ix_proxy_discoveries_*` | `(proxy_id)`, `(discovered_at)`, `(source_type)` | provenance lookups |
-| `uq_proxy_publications_success` | `(proxy_id, channel_id) WHERE status = 'success'` | one successful post per proxy per channel |
+| `uq_proxy_publications_proxy_channel` | `UNIQUE (proxy_id, channel_id)` | one outbox row per proxy per channel |
+| `ix_proxy_publications_due` | `(next_attempt_at, id) WHERE status = 'pending'` | publisher claim |
+| `ix_proxy_publications_sending_lease` | `(lease_until) WHERE status = 'sending'` | stale-lease recovery |
 | `ix_proxy_publications_proxy_id` | `(proxy_id)` | audit by identity |
 | `ix_proxy_publications_created_at` | `(created_at)` | time-range sweeps |
 

@@ -23,11 +23,15 @@ class PublishResult:
     ok: bool
     telegram_message_id: int | None
     error_safe: str | None = None
+    error_code: int | None = None
+    retry_after: float | None = None
+    retryable: bool = False
 
     def __repr__(self) -> str:
         return (
             f"<PublishResult ok={self.ok} message_id={self.telegram_message_id} "
-            f"error={self.error_safe!r}>"
+            f"code={self.error_code} retryable={self.retryable} "
+            f"retry_after={self.retry_after} error={self.error_safe!r}>"
         )
 
 

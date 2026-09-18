@@ -8,6 +8,44 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 014 — Telegram publishing reliability
+
+### D-048 · Outbox lifecycle, leased claim, honest at-least-once
+
+**Context.** Task 013 posted then wrote `proxy_publications`. A crash after
+Telegram accepted `sendMessage` but before the audit commit caused the next
+tick to send the same proxy again. Bot API has no idempotency key.
+
+**Decision.**
+
+1. **One row per ``(proxy_id, channel_id)``.** Identity, not an attempt log.
+   Unique always, not only on success.
+2. **Lifecycle.** ``pending`` → ``sending`` → ``published``. Transient
+   failures return to ``pending`` with ``next_attempt_at``. Permanent
+   failures (400/401/403/404, or exhausted retries) become ``failed``.
+3. **Claim then send.** ``FOR UPDATE SKIP LOCKED`` sets ``sending`` +
+   ``lease_until``, commits, then HTTP. Telegram I/O never holds a
+   transaction (same rule as D-024).
+4. **Stale recovery.** ``sending`` with ``lease_until < now`` returns to
+   ``pending``. Default lease 60s (``TELEGRAM_PUBLICATION_LEASE_SECONDS``),
+   longer than the Bot API timeout.
+5. **Retry.** Exponential backoff ``min(base * 2**(n-1), max)``, at least
+   Telegram ``retry_after`` / ``Retry-After``. No ``sleep`` in the worker;
+   the next tick picks due rows. Clock is injectable.
+6. **Exactly-once is not claimed.** Crash after Telegram accept and before
+   ``published`` still retries the send (at-least-once). The unique row
+   stops *further* repeats once ``published`` commits.
+
+**Evidence.** Claim SQL unit tests; concurrent SKIP LOCKED integration;
+crash-window integration that documents the second send; 429 / 5xx / 400
+paths; ``alembic check`` on 0003.
+
+**Consequences.** Selection and scoring are unchanged. A recovered
+``sending`` row may produce one duplicate Telegram message; that is the
+Bot API limitation, not a bug to paper over.
+
+---
+
 ## Task 013 — Telegram channel publishing
 
 ### D-047 · Publish Task 012 selection via Bot API; unique success per channel

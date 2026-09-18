@@ -41,6 +41,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -199,10 +200,17 @@ class SourceType(StrEnum):
 
 
 class PublicationStatus(StrEnum):
-    """Outcome of one Telegram publish attempt. ``VARCHAR``, not a native enum."""
+    """Lifecycle of one ``(proxy_id, channel_id)`` outbox row. ``VARCHAR``.
 
-    SUCCESS = "success"
-    FAILURE = "failure"
+    ``pending`` → ``sending`` → ``published``. Transient failures return to
+    ``pending`` with ``next_attempt_at``. Permanent failures become ``failed``.
+    ``sending`` with an expired lease is recovered back to ``pending``.
+    """
+
+    PENDING = "pending"
+    SENDING = "sending"
+    PUBLISHED = "published"
+    FAILED = "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -700,39 +708,59 @@ class ProxyScore(Base):
 
 
 class ProxyPublication(Base):
-    """One attempt to post a selected proxy to a Telegram channel.
+    """One outbox row per ``(proxy_id, channel_id)``.
 
-    Append-only. A successful post is unique per ``(proxy_id, channel_id)`` so
-    a publisher tick cannot spam the same identity. Failures are recorded and
-    may be retried on a later cycle. The message body (which contains the
-    MTProto secret) is **not** stored here.
+    Not an append-only attempt log: retries update this row in place
+    (``attempt_count``, ``next_attempt_at``, ``status``). The channel message
+    body (MTProto secret) is **not** stored here.
     """
 
     __tablename__ = "proxy_publications"
     __table_args__ = (
         CheckConstraint("char_length(channel_id) > 0", name="channel_id_not_blank"),
-        CheckConstraint("status IN ('success', 'failure')", name="status_known"),
         CheckConstraint(
-            "status <> 'success' OR telegram_message_id IS NOT NULL",
-            name="success_needs_message_id",
+            "status IN ('pending', 'sending', 'published', 'failed')",
+            name="status_known",
         ),
         CheckConstraint(
-            "status <> 'failure' OR error_message_safe IS NOT NULL",
-            name="failure_needs_error",
+            "status <> 'published' OR telegram_message_id IS NOT NULL",
+            name="published_needs_message_id",
         ),
+        CheckConstraint(
+            "status = 'published' OR telegram_message_id IS NULL",
+            name="message_id_only_when_published",
+        ),
+        CheckConstraint(
+            "status <> 'failed' OR error_message_safe IS NOT NULL",
+            name="failed_needs_error",
+        ),
+        CheckConstraint(
+            "status <> 'sending' OR lease_until IS NOT NULL",
+            name="sending_needs_lease",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
         CheckConstraint(
             "error_message_safe IS NULL "
             f"OR char_length(error_message_safe) <= {ERROR_MESSAGE_MAX_LENGTH}",
             name="error_message_bounded",
         ),
+        UniqueConstraint(
+            "proxy_id",
+            "channel_id",
+            name="uq_proxy_publications_proxy_channel",
+        ),
         Index("ix_proxy_publications_proxy_id", "proxy_id"),
         Index("ix_proxy_publications_created_at", "created_at"),
         Index(
-            "uq_proxy_publications_success",
-            "proxy_id",
-            "channel_id",
-            unique=True,
-            postgresql_where=text("status = 'success'"),
+            "ix_proxy_publications_due",
+            "next_attempt_at",
+            "id",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_proxy_publications_sending_lease",
+            "lease_until",
+            postgresql_where=text("status = 'sending'"),
         ),
     )
 
@@ -746,6 +774,14 @@ class ProxyPublication(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     error_message_safe: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -755,5 +791,6 @@ class ProxyPublication(Base):
     def __repr__(self) -> str:
         return (
             f"<ProxyPublication id={self.id} proxy_id={self.proxy_id} "
-            f"status={self.status} message_id={self.telegram_message_id}>"
+            f"status={self.status} message_id={self.telegram_message_id} "
+            f"attempts={self.attempt_count}>"
         )

@@ -361,23 +361,36 @@ class TestPublicationConstraints:
             "status",
             "telegram_message_id",
             "error_message_safe",
+            "attempt_count",
+            "last_attempt_at",
+            "next_attempt_at",
+            "lease_until",
             "created_at",
         }
 
-    def test_success_is_unique_per_proxy_and_channel(self) -> None:
-        index = index_by_name(ProxyPublication.__table__, "uq_proxy_publications_success")
-        rendered = index_ddl(index)
-        assert "UNIQUE" in rendered.upper() or index.unique is True  # type: ignore[attr-defined]
-        assert "WHERE status = 'success'" in rendered
-        names = [c.name for c in index.columns]  # type: ignore[attr-defined]
-        assert names == ["proxy_id", "channel_id"]
+    def test_identity_is_unique_per_proxy_and_channel(self) -> None:
+        names = {
+            constraint.name
+            for constraint in table_of(ProxyPublication).constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+        assert "uq_proxy_publications_proxy_channel" in names
 
     def test_status_and_outcome_checks(self) -> None:
         rendered = ddl(ProxyPublication.__table__)
-        assert "status IN ('success', 'failure')" in rendered
+        assert "status IN ('pending', 'sending', 'published', 'failed')" in rendered
         assert "telegram_message_id IS NOT NULL" in rendered
         assert "error_message_safe IS NOT NULL" in rendered
+        assert "lease_until IS NOT NULL" in rendered
+        assert "attempt_count >= 0" in rendered
         assert f"char_length(error_message_safe) <= {ERROR_MESSAGE_MAX_LENGTH}" in rendered
+
+    def test_due_index_is_partial_on_pending(self) -> None:
+        index = index_by_name(ProxyPublication.__table__, "ix_proxy_publications_due")
+        rendered = index_ddl(index)
+        assert "WHERE status = 'pending'" in rendered
+        names = [c.name for c in index.columns]  # type: ignore[attr-defined]
+        assert names == ["next_attempt_at", "id"]
 
     def test_status_is_varchar_not_a_native_enum(self) -> None:
         column = ProxyPublication.__table__.c.status
@@ -385,17 +398,25 @@ class TestPublicationConstraints:
         assert "CREATE TYPE" not in ddl(ProxyPublication.__table__)
 
     def test_publication_status_values(self) -> None:
-        assert set(PublicationStatus) == {PublicationStatus.SUCCESS, PublicationStatus.FAILURE}
-        value: str = PublicationStatus.SUCCESS
-        assert value == "success"
+        assert set(PublicationStatus) == {
+            PublicationStatus.PENDING,
+            PublicationStatus.SENDING,
+            PublicationStatus.PUBLISHED,
+            PublicationStatus.FAILED,
+        }
+        value: str = PublicationStatus.PUBLISHED
+        assert value == "published"
 
     def test_repr_has_no_secret(self) -> None:
         row = ProxyPublication(
-            proxy_id=1, channel_id="@chan", status="success", telegram_message_id=9
+            proxy_id=1,
+            channel_id="@chan",
+            status="published",
+            telegram_message_id=9,
         )
         rendered = repr(row)
-        assert "success" in rendered
-        assert "secret" not in rendered.lower() or "secret=" not in rendered
+        assert "published" in rendered
+        assert "secret=" not in rendered
 
 
 class TestScoreConstraints:

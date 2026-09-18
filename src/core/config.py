@@ -171,6 +171,12 @@ class Settings(BaseSettings):
     telegram_channel_id: str | None = Field(default=None)
     publisher_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     publisher_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    #: How long a ``sending`` row is leased. Must exceed the Bot API timeout
+    #: so a slow-but-alive ``sendMessage`` is not double-claimed.
+    telegram_publication_lease_seconds: float = Field(default=60.0, gt=0, le=3600)
+    telegram_max_retries: int = Field(default=8, ge=1, le=100)
+    telegram_retry_base_seconds: float = Field(default=2.0, gt=0, le=3600)
+    telegram_retry_max_seconds: float = Field(default=300.0, gt=0, le=3600)
 
     # --- HTTP ranking API (Task 007) ---------------------------------------
     #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.
@@ -257,6 +263,13 @@ class Settings(BaseSettings):
         """Default page size must not exceed the operator-configured cap."""
         if self.report_default_limit > self.report_max_limit:
             msg = "report_default_limit must be <= report_max_limit"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _check_publisher_retry_bounds(self) -> Settings:
+        if self.telegram_retry_max_seconds < self.telegram_retry_base_seconds:
+            msg = "telegram_retry_max_seconds must be >= telegram_retry_base_seconds"
             raise ValueError(msg)
         return self
 

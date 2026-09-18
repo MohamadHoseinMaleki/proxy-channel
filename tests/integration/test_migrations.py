@@ -201,7 +201,7 @@ class TestUpgrade:
     def test_records_the_revision(self, lifecycle_url: str) -> None:
         _run_alembic(lifecycle_url, "upgrade", "head")
         output = _run_alembic(lifecycle_url, "current")
-        assert "0002 (head)" in output
+        assert "0003 (head)" in output
 
     def test_no_drift_between_the_models_and_the_database(self, lifecycle_url: str) -> None:
         # The strongest single assertion available: regenerate a diff against the

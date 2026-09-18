@@ -21,14 +21,27 @@ __all__ = [
     "BOT_API_BASE",
     "BotApiTelegramPublisher",
     "TelegramPublishError",
+    "is_retryable_status",
 ]
 
 BOT_API_BASE: Final = "https://api.telegram.org"
 _TOKEN_RE: Final = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+_PERMANENT_CODES: Final = frozenset({400, 401, 403, 404})
 
 
 class TelegramPublishError(Exception):
-    """Raised only for programmer errors (bad token / empty message)."""
+    """Raised only for programmer errors (bad token / empty channel)."""
+
+
+def is_retryable_status(code: int | None) -> bool:
+    """Whether an HTTP / Bot API error code should be retried.
+
+    ``None`` means a transport failure (timeout, connect error) — retry.
+    ``429`` and ``5xx`` are transient. ``400``/``401``/``403``/``404`` are not.
+    """
+    if code is None:
+        return True
+    return bool(code == 429 or code >= 500)
 
 
 class BotApiTelegramPublisher:
@@ -89,6 +102,8 @@ class BotApiTelegramPublisher:
                 ok=False,
                 telegram_message_id=None,
                 error_safe="empty_message",
+                error_code=400,
+                retryable=False,
             )
         payload = {
             "chat_id": self._channel_id,
@@ -98,17 +113,26 @@ class BotApiTelegramPublisher:
         try:
             client = await self._session()
             response = await client.post(self._url(), json=payload)
+        except httpx.TimeoutException as exc:
+            return PublishResult(
+                ok=False,
+                telegram_message_id=None,
+                error_safe=safe_error_message(exc) or type(exc).__name__,
+                retryable=True,
+            )
         except httpx.HTTPError as exc:
             return PublishResult(
                 ok=False,
                 telegram_message_id=None,
                 error_safe=safe_error_message(exc) or type(exc).__name__,
+                retryable=True,
             )
 
         return _parse_send_message_response(response)
 
 
 def _parse_send_message_response(response: httpx.Response) -> PublishResult:
+    retry_after = _retry_after_from_header(response)
     try:
         body: Any = response.json()
     except json.JSONDecodeError:
@@ -116,13 +140,20 @@ def _parse_send_message_response(response: httpx.Response) -> PublishResult:
             ok=False,
             telegram_message_id=None,
             error_safe=f"HTTP {response.status_code}: invalid JSON",
+            error_code=response.status_code or None,
+            retry_after=retry_after,
+            retryable=True,
         )
     if not isinstance(body, dict):
         return PublishResult(
             ok=False,
             telegram_message_id=None,
             error_safe=f"HTTP {response.status_code}: unexpected payload",
+            error_code=response.status_code or None,
+            retry_after=retry_after,
+            retryable=True,
         )
+    retry_after = _max_retry_after(retry_after, _retry_after_from_body(body))
     if body.get("ok") is True:
         result = body.get("result")
         message_id = result.get("message_id") if isinstance(result, dict) else None
@@ -132,14 +163,55 @@ def _parse_send_message_response(response: httpx.Response) -> PublishResult:
             ok=False,
             telegram_message_id=None,
             error_safe="missing telegram message id",
+            retryable=True,
         )
     description = body.get("description")
-    code = body.get("error_code", response.status_code)
+    raw_code = body.get("error_code", response.status_code)
+    code = raw_code if isinstance(raw_code, int) and not isinstance(raw_code, bool) else None
     detail = (
         description if isinstance(description, str) and description.strip() else "telegram_error"
     )
+    retryable = is_retryable_status(code)
+    if code in _PERMANENT_CODES:
+        retryable = False
     return PublishResult(
         ok=False,
         telegram_message_id=None,
         error_safe=safe_error_message(f"HTTP {code}: {detail}") or "telegram_error",
+        error_code=code,
+        retry_after=retry_after,
+        retryable=retryable,
     )
+
+
+def _retry_after_from_body(body: dict[str, Any]) -> float | None:
+    params = body.get("parameters")
+    if not isinstance(params, dict):
+        return None
+    raw = params.get("retry_after")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if raw < 0:
+        return None
+    return float(raw)
+
+
+def _retry_after_from_header(response: httpx.Response) -> float | None:
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        value = float(header.strip())
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _max_retry_after(left: float | None, right: float | None) -> float | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return max(left, right)

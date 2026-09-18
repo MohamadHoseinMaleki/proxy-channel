@@ -1,24 +1,31 @@
-"""Publish :class:`~modules.reporting.models.Report` items to Telegram.
+"""Publish :class:`~modules.reporting.models.Report` items via an outbox.
 
 Consumes Task 012 selection. Does not rescore, re-rank, or rewrite eligibility.
-Telegram I/O happens **outside** a database transaction. One failed post is
-recorded and the rest of the batch continues.
+Telegram I/O happens **outside** a database transaction after rows are claimed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from core.config import Settings
 from core.database import Database
 from core.logger import get_logger, safe_error_message
-from core.models import ProxyPublication, PublicationStatus
+from core.models import ProxyPublication, PublicationStatus, utcnow
 from modules.discovery.models import SecretType
+from modules.publishing.backoff import (
+    DEFAULT_LEASE_SECONDS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_SECONDS,
+    DEFAULT_RETRY_MAX_SECONDS,
+    retry_delay_seconds,
+)
+from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.message import format_channel_message
 from modules.publishing.protocol import PublishResult, TelegramPublisher
 from modules.reporting.models import Report, ReportItem
@@ -37,17 +44,20 @@ class PublishCycleResult:
     published: int
     skipped: int
     failed: int
+    recovered: int
+    retried: int
     channel_id: str
 
     def __repr__(self) -> str:
         return (
             f"<PublishCycleResult selected={self.selected} published={self.published} "
-            f"skipped={self.skipped} failed={self.failed}>"
+            f"skipped={self.skipped} failed={self.failed} recovered={self.recovered} "
+            f"retried={self.retried}>"
         )
 
 
 class PublishingService:
-    """Select publishable proxies, post them, persist the audit trail."""
+    """Enqueue ``select_top`` into the outbox, claim, post, persist."""
 
     def __init__(
         self,
@@ -68,125 +78,273 @@ class PublishingService:
         self.reporting = (
             reporting if reporting is not None else ReportingService(db, settings=settings)
         )
+        self.lease_seconds = (
+            settings.telegram_publication_lease_seconds if settings else DEFAULT_LEASE_SECONDS
+        )
+        self.max_retries = settings.telegram_max_retries if settings else DEFAULT_MAX_RETRIES
+        self.retry_base_seconds = (
+            settings.telegram_retry_base_seconds if settings else DEFAULT_RETRY_BASE_SECONDS
+        )
+        self.retry_max_seconds = (
+            settings.telegram_retry_max_seconds if settings else DEFAULT_RETRY_MAX_SECONDS
+        )
 
     async def publish_cycle(
         self,
         *,
         limit: int | None = None,
         as_of: datetime | None = None,
+        now: datetime | None = None,
     ) -> PublishCycleResult:
-        """Load Task 012's selection and publish each item at most once."""
+        """Load Task 012's selection and drive the outbox one tick."""
         report = await self.reporting.select_top(limit=limit, as_of=as_of)
-        return await self.publish_report(report)
+        return await self.publish_report(report, now=now)
 
-    async def publish_report(self, report: Report) -> PublishCycleResult:
-        already = await self._successful_proxy_ids(tuple(item.proxy_id for item in report.items))
-        published = 0
-        skipped = 0
-        failed = 0
+    async def publish_report(
+        self,
+        report: Report,
+        *,
+        now: datetime | None = None,
+    ) -> PublishCycleResult:
+        moment = now or utcnow()
+        if moment.tzinfo is None:
+            msg = "now must be timezone-aware; use core.models.utcnow()"
+            raise ValueError(msg)
+
+        items_by_id = {item.proxy_id: item for item in report.items}
+        eligible = [item for item in report.items if _is_safe_to_post(item)]
+        skipped = len(report.items) - len(eligible)
         for item in report.items:
-            if item.proxy_id in already:
-                skipped += 1
-                _logger.info("publication_skipped_duplicate", proxy_id=item.proxy_id)
-                continue
-            if not _is_safe_to_post(item):
-                skipped += 1
+            if item.proxy_id not in {entry.proxy_id for entry in eligible}:
                 _logger.warning("publication_skipped_unpublishable", proxy_id=item.proxy_id)
+
+        await self._enqueue(eligible, now=moment)
+        recovered = await self._recover(now=moment)
+
+        claimed: list[ProxyPublication] = []
+        if eligible:
+            async with self.db.session_scope() as session:
+                claimed = await claim_due_publications(
+                    session,
+                    channel_id=self.channel_id,
+                    proxy_ids=[item.proxy_id for item in eligible],
+                    limit=max(len(eligible), 1),
+                    lease_seconds=self.lease_seconds,
+                    now=moment,
+                )
+
+        published = 0
+        failed = 0
+        retried = 0
+        for row in claimed:
+            claimed_item = items_by_id.get(row.proxy_id)
+            if claimed_item is None or not _is_safe_to_post(claimed_item):
+                await self._release_unsendable(row, now=moment)
+                skipped += 1
                 continue
-            outcome = await self._publish_one(item)
-            if outcome is PublicationStatus.SUCCESS:
+            outcome = await self._send_claimed(row, claimed_item, now=moment)
+            if outcome is PublicationStatus.PUBLISHED:
                 published += 1
-                already.add(item.proxy_id)
-            else:
+            elif outcome is PublicationStatus.FAILED:
                 failed += 1
+            else:
+                retried += 1
+
+        skipped += max(len(eligible) - len(claimed), 0)
+
         _logger.info(
             "publication_cycle_completed",
             selected=len(report.items),
             published=published,
             skipped=skipped,
             failed=failed,
+            recovered=len(recovered),
+            retried=retried,
         )
         return PublishCycleResult(
             selected=len(report.items),
             published=published,
             skipped=skipped,
             failed=failed,
+            recovered=len(recovered),
+            retried=retried,
             channel_id=self.channel_id,
         )
 
-    async def _publish_one(self, item: ReportItem) -> PublicationStatus:
+    async def _enqueue(self, items: list[ReportItem], *, now: datetime) -> None:
+        if not items:
+            return
+        values = [
+            {
+                "proxy_id": item.proxy_id,
+                "channel_id": self.channel_id,
+                "status": PublicationStatus.PENDING,
+                "next_attempt_at": now,
+                "attempt_count": 0,
+            }
+            for item in items
+        ]
+        statement = (
+            insert(ProxyPublication)
+            .values(values)
+            .on_conflict_do_nothing(constraint="uq_proxy_publications_proxy_channel")
+        )
+        async with self.db.session_scope() as session:
+            await session.execute(statement)
+
+    async def _recover(self, *, now: datetime) -> list[int]:
+        async with self.db.session_scope() as session:
+            return await recover_stale_publications(session, channel_id=self.channel_id, now=now)
+
+    async def _send_claimed(
+        self,
+        row: ProxyPublication,
+        item: ReportItem,
+        *,
+        now: datetime,
+    ) -> PublicationStatus:
         text = format_channel_message(item)
         try:
             result = await self.publisher.publish(text)
         except Exception as exc:
-            # CancelledError is BaseException, not Exception, and still
-            # propagates so a shutdown cannot be recorded as a failed post.
+            # CancelledError is BaseException and still propagates.
             result = PublishResult(
                 ok=False,
                 telegram_message_id=None,
                 error_safe=safe_error_message(exc) or type(exc).__name__,
+                retryable=True,
             )
         if result.ok and result.telegram_message_id is not None:
-            stored = await self._record(
-                proxy_id=item.proxy_id,
-                status=PublicationStatus.SUCCESS,
-                telegram_message_id=result.telegram_message_id,
-                error_message_safe=None,
-            )
+            stored = await self._mark_published(row, result.telegram_message_id)
             if stored:
                 _logger.info(
-                    "publication_succeeded",
+                    "publication_published",
                     proxy_id=item.proxy_id,
+                    publication_id=row.id,
                     telegram_message_id=result.telegram_message_id,
                 )
-                return PublicationStatus.SUCCESS
-            _logger.info("publication_skipped_duplicate", proxy_id=item.proxy_id)
-            return PublicationStatus.FAILURE
+                return PublicationStatus.PUBLISHED
+            return PublicationStatus.FAILED
 
         error = result.error_safe or "telegram_publish_failed"
-        await self._record(
+        if result.error_code == 429:
+            _logger.warning(
+                "telegram_rate_limited",
+                proxy_id=item.proxy_id,
+                publication_id=row.id,
+                retry_after=result.retry_after,
+            )
+        attempts_after = row.attempt_count + 1
+        retryable = result.retryable and attempts_after < self.max_retries
+        if retryable:
+            delay = retry_delay_seconds(
+                attempt=attempts_after,
+                base_seconds=self.retry_base_seconds,
+                max_seconds=self.retry_max_seconds,
+                retry_after=result.retry_after,
+            )
+            await self._schedule_retry(row, error=error, delay_seconds=delay, now=now)
+            _logger.info(
+                "publication_retry_scheduled",
+                proxy_id=item.proxy_id,
+                publication_id=row.id,
+                attempt=attempts_after,
+                delay_seconds=delay,
+            )
+            return PublicationStatus.PENDING
+
+        await self._mark_failed(row, error=error)
+        _logger.warning(
+            "publication_permanently_failed",
             proxy_id=item.proxy_id,
-            status=PublicationStatus.FAILURE,
-            telegram_message_id=None,
-            error_message_safe=error,
+            publication_id=row.id,
+            attempt=attempts_after,
+            error=error,
         )
-        _logger.warning("publication_failed", proxy_id=item.proxy_id, error=error)
-        return PublicationStatus.FAILURE
+        return PublicationStatus.FAILED
 
-    async def _successful_proxy_ids(self, proxy_ids: Sequence[int]) -> set[int]:
-        if not proxy_ids:
-            return set()
-        statement = select(ProxyPublication.proxy_id).where(
-            ProxyPublication.channel_id == self.channel_id,
-            ProxyPublication.status == PublicationStatus.SUCCESS,
-            ProxyPublication.proxy_id.in_(tuple(proxy_ids)),
-        )
-        async with self.db.session_scope() as session:
-            rows = (await session.execute(statement)).scalars().all()
-        return set(rows)
-
-    async def _record(
-        self,
-        *,
-        proxy_id: int,
-        status: PublicationStatus,
-        telegram_message_id: int | None,
-        error_message_safe: str | None,
-    ) -> bool:
-        row = ProxyPublication(
-            proxy_id=proxy_id,
-            channel_id=self.channel_id,
-            status=str(status),
-            telegram_message_id=telegram_message_id,
-            error_message_safe=error_message_safe,
+    async def _mark_published(self, row: ProxyPublication, message_id: int) -> bool:
+        statement = (
+            update(ProxyPublication)
+            .where(
+                ProxyPublication.id == row.id,
+                ProxyPublication.status == PublicationStatus.SENDING,
+            )
+            .values(
+                status=PublicationStatus.PUBLISHED,
+                telegram_message_id=message_id,
+                error_message_safe=None,
+                lease_until=None,
+                attempt_count=ProxyPublication.attempt_count + 1,
+            )
         )
         try:
             async with self.db.session_scope() as session:
-                session.add(row)
-            return True
+                result = await session.execute(statement)
+                return int(getattr(result, "rowcount", 0) or 0) == 1
         except IntegrityError:
-            _logger.info("publication_unique_conflict", proxy_id=proxy_id)
+            _logger.info("publication_unique_conflict", proxy_id=row.proxy_id)
             return False
+
+    async def _schedule_retry(
+        self,
+        row: ProxyPublication,
+        *,
+        error: str,
+        delay_seconds: float,
+        now: datetime,
+    ) -> None:
+        nxt = now + timedelta(seconds=delay_seconds)
+        statement = (
+            update(ProxyPublication)
+            .where(
+                ProxyPublication.id == row.id,
+                ProxyPublication.status == PublicationStatus.SENDING,
+            )
+            .values(
+                status=PublicationStatus.PENDING,
+                lease_until=None,
+                error_message_safe=error,
+                next_attempt_at=nxt,
+                attempt_count=ProxyPublication.attempt_count + 1,
+            )
+        )
+        async with self.db.session_scope() as session:
+            await session.execute(statement)
+
+    async def _mark_failed(self, row: ProxyPublication, *, error: str) -> None:
+        statement = (
+            update(ProxyPublication)
+            .where(
+                ProxyPublication.id == row.id,
+                ProxyPublication.status == PublicationStatus.SENDING,
+            )
+            .values(
+                status=PublicationStatus.FAILED,
+                lease_until=None,
+                telegram_message_id=None,
+                error_message_safe=error,
+                attempt_count=ProxyPublication.attempt_count + 1,
+            )
+        )
+        async with self.db.session_scope() as session:
+            await session.execute(statement)
+
+    async def _release_unsendable(self, row: ProxyPublication, *, now: datetime) -> None:
+        statement = (
+            update(ProxyPublication)
+            .where(
+                ProxyPublication.id == row.id,
+                ProxyPublication.status == PublicationStatus.SENDING,
+            )
+            .values(
+                status=PublicationStatus.PENDING,
+                lease_until=None,
+                next_attempt_at=now + timedelta(seconds=self.retry_base_seconds),
+            )
+        )
+        async with self.db.session_scope() as session:
+            await session.execute(statement)
 
 
 def _is_safe_to_post(item: ReportItem) -> bool:
