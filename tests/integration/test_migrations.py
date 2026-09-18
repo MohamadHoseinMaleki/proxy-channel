@@ -236,6 +236,74 @@ class TestUpgrade:
 
         asyncio.run(_insert())
 
+    def test_0003_rewrites_existing_0002_publication_rows(self, lifecycle_url: str) -> None:
+        """A live 013 database must survive 0003. Empty-DB upgrades hide this."""
+        from sqlalchemy import text as sql_text
+
+        # Shared lifecycle DB may already be at head. `upgrade 0002` does not
+        # walk backwards; start from base so this is a real 0002 → 0003 path.
+        _run_alembic(lifecycle_url, "downgrade", "base")
+        _run_alembic(lifecycle_url, "upgrade", "0002")
+
+        async def _seed_and_upgrade() -> list[tuple[str, int | None, str | None, int]]:
+            engine = create_async_engine(lifecycle_url)
+            try:
+                async with engine.begin() as connection:
+                    proxy_id = (
+                        await connection.execute(
+                            sql_text(
+                                "INSERT INTO proxies (server, port, secret, fingerprint) "
+                                "VALUES ('compat.example.com', 443, 'ee00', :fp) "
+                                "RETURNING id"
+                            ),
+                            {"fp": "c" * 64},
+                        )
+                    ).scalar_one()
+                    await connection.execute(
+                        sql_text(
+                            "INSERT INTO proxy_publications "
+                            "(proxy_id, channel_id, status, telegram_message_id, "
+                            "error_message_safe) VALUES "
+                            "(:pid, '@chan', 'success', 77, NULL), "
+                            "(:pid, '@other', 'failure', NULL, 'telegram_unavailable')"
+                        ),
+                        {"pid": proxy_id},
+                    )
+            finally:
+                await engine.dispose()
+
+            _run_alembic(lifecycle_url, "upgrade", "head")
+
+            engine = create_async_engine(lifecycle_url)
+            try:
+                async with engine.connect() as connection:
+                    rows = (
+                        await connection.execute(
+                            sql_text(
+                                "SELECT status, telegram_message_id, error_message_safe, "
+                                "attempt_count FROM proxy_publications "
+                                "ORDER BY channel_id"
+                            )
+                        )
+                    ).all()
+                    return [
+                        (
+                            str(row.status),
+                            row.telegram_message_id,
+                            row.error_message_safe,
+                            int(row.attempt_count),
+                        )
+                        for row in rows
+                    ]
+            finally:
+                await engine.dispose()
+
+        rows = asyncio.run(_seed_and_upgrade())
+        assert rows == [
+            ("published", 77, None, 1),
+            ("pending", None, "telegram_unavailable", 1),
+        ]
+
 
 class TestDowngrade:
     def test_downgrade_base_removes_every_table(self, lifecycle_url: str) -> None:

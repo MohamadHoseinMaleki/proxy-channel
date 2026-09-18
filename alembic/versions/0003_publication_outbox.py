@@ -55,6 +55,22 @@ def upgrade() -> None:
         sa.Column("lease_until", sa.DateTime(timezone=True), nullable=True),
     )
 
+    # Drop 0002 CHECKs *before* rewriting status. ``success`` → ``published``
+    # would otherwise violate ``status IN ('success', 'failure')``.
+    op.drop_constraint(
+        op.f("ck_proxy_publications_status_known"), "proxy_publications", type_="check"
+    )
+    op.drop_constraint(
+        op.f("ck_proxy_publications_success_needs_message_id"),
+        "proxy_publications",
+        type_="check",
+    )
+    op.drop_constraint(
+        op.f("ck_proxy_publications_failure_needs_error"),
+        "proxy_publications",
+        type_="check",
+    )
+
     op.execute(
         sa.text(
             """
@@ -97,20 +113,6 @@ def upgrade() -> None:
               AND extra.status <> 'published'
             """
         )
-    )
-
-    op.drop_constraint(
-        op.f("ck_proxy_publications_status_known"), "proxy_publications", type_="check"
-    )
-    op.drop_constraint(
-        op.f("ck_proxy_publications_success_needs_message_id"),
-        "proxy_publications",
-        type_="check",
-    )
-    op.drop_constraint(
-        op.f("ck_proxy_publications_failure_needs_error"),
-        "proxy_publications",
-        type_="check",
     )
     op.create_check_constraint(
         op.f("ck_proxy_publications_status_known"),
