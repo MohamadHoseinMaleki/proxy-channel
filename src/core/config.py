@@ -177,6 +177,15 @@ class Settings(BaseSettings):
     telegram_max_retries: int = Field(default=8, ge=1, le=100)
     telegram_retry_base_seconds: float = Field(default=2.0, gt=0, le=3600)
     telegram_retry_max_seconds: float = Field(default=300.0, gt=0, le=3600)
+    #: Minimum gap between *new* outbox inserts for one channel (Task 016).
+    #: Existing pending/sending rows are still claimed and sent (D-048).
+    telegram_publication_interval_seconds: float = Field(default=300.0, gt=0, le=86400)
+    #: A proxy published more recently than this is not scheduled again.
+    #: Conservative with the unique ``(proxy_id, channel_id)`` row: rotation
+    #: is off; this window is an extra spam guard, not a second identity.
+    telegram_publication_dedup_seconds: float = Field(default=86400.0, ge=0, le=30 * 86400)
+    #: Do not enqueue more while pending+sending is at this cap.
+    telegram_publication_max_pending: int = Field(default=20, ge=1, le=500)
 
     # --- HTTP ranking API (Task 007) ---------------------------------------
     #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.

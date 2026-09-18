@@ -17,6 +17,7 @@ from core.models import (
     ProxyObservation,
     ProxyPublication,
     ProxyScore,
+    PublicationSchedule,
     PublicationStatus,
     utcnow,
 )
@@ -24,6 +25,7 @@ from modules.discovery.models import SecretType
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.fake import FakeTelegramPublisher
 from modules.publishing.protocol import PublishResult
+from modules.publishing.scheduler import schedule_new_publications
 from modules.publishing.service import PublishingService
 from modules.publishing.validation import PublicationRejection
 from modules.reporting.models import Report, ReportItem
@@ -100,10 +102,14 @@ async def test_select_top_is_published_and_not_duplicated(db: Database) -> None:
     await _ready(db, second.id, score="40.000", now=now)
 
     publisher = FakeTelegramPublisher()
-    service = _service(db, publisher)
-    result = await service.publish_cycle(as_of=now, limit=10, now=now)
-    assert result.published == 2
-    assert result.failed == 0
+    service = _service(db, publisher, telegram_publication_interval_seconds=60)
+    first_tick = await service.publish_cycle(as_of=now, limit=10, now=now)
+    assert first_tick.published == 1
+    later = now + timedelta(seconds=60)
+    second_tick = await service.publish_cycle(as_of=later, limit=10, now=later)
+    assert second_tick.published == 1
+    assert first_tick.failed == 0
+    assert second_tick.failed == 0
     assert len(publisher.messages) == 2
     assert "1.1.1.1" in publisher.messages[0]
 
@@ -120,7 +126,7 @@ async def test_select_top_is_published_and_not_duplicated(db: Database) -> None:
         assert [row.telegram_message_id for row in rows] == [1, 2]
         assert all(row.attempt_count == 1 for row in rows)
 
-    again = await service.publish_cycle(as_of=now, limit=10, now=now)
+    again = await service.publish_cycle(as_of=later, limit=10, now=later)
     assert again.published == 0
     assert again.skipped == 2
     assert len(publisher.messages) == 2
@@ -245,10 +251,12 @@ async def test_one_failure_does_not_stop_the_batch(db: Database) -> None:
             PublishResult(ok=True, telegram_message_id=9),
         ]
     )
-    service = _service(db, publisher)
-    result = await service.publish_cycle(as_of=now, limit=10, now=now)
-    assert result.published == 1
-    assert result.failed == 1
+    service = _service(db, publisher, telegram_publication_interval_seconds=60)
+    first_tick = await service.publish_cycle(as_of=now, limit=10, now=now)
+    later = now + timedelta(seconds=60)
+    second_tick = await service.publish_cycle(as_of=later, limit=10, now=later)
+    assert first_tick.failed == 1
+    assert second_tick.published == 1
     assert len(publisher.messages) == 2
 
 
@@ -482,3 +490,194 @@ async def test_enqueue_conflict_does_not_reset_published(db: Database) -> None:
         rows = (await session.execute(select(ProxyPublication))).scalars().all()
         assert len(rows) == 1
         assert rows[0].status == PublicationStatus.PUBLISHED
+
+
+@pytest.mark.asyncio
+async def test_interval_blocks_a_second_new_publication(db: Database) -> None:
+    now = utcnow()
+    first = await _add_proxy(db, server="1.1.1.1")
+    second = await _add_proxy(db, server="1.0.0.1", secret="dd" + "01" * 16)
+    await _ready(db, first.id, score="90.000", now=now)
+    await _ready(db, second.id, score="40.000", now=now)
+    publisher = FakeTelegramPublisher()
+    service = _service(db, publisher, telegram_publication_interval_seconds=300)
+    first_tick = await service.publish_cycle(as_of=now, limit=10, now=now)
+    assert first_tick.published == 1
+    too_soon = await service.publish_cycle(as_of=now + timedelta(seconds=10), limit=10, now=now)
+    assert too_soon.published == 0
+    async with db.session_scope() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(ProxyPublication))
+        ).scalar_one()
+        last = (await session.execute(select(PublicationSchedule.last_scheduled_at))).scalar_one()
+    assert count == 1
+    assert last == now
+    later = now + timedelta(seconds=300)
+    second_tick = await service.publish_cycle(as_of=later, limit=10, now=later)
+    assert second_tick.published == 1
+    assert len(publisher.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_already_published_is_not_enqueued_again(db: Database) -> None:
+    now = utcnow()
+    proxy = await _add_proxy(db, server="8.8.8.8", secret="dd" + "aa" * 16)
+    await _ready(db, proxy.id, score="70.000", now=now)
+    service = _service(db, FakeTelegramPublisher(), telegram_publication_interval_seconds=1)
+    await service.publish_cycle(as_of=now, limit=5, now=now)
+    later = now + timedelta(seconds=2)
+    again = await service.publish_cycle(as_of=later, limit=5, now=later)
+    assert again.published == 0
+    async with db.session_scope() as session:
+        rows = (await session.execute(select(ProxyPublication))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == PublicationStatus.PUBLISHED
+
+
+@pytest.mark.asyncio
+async def test_failed_publication_does_not_spawn_infinite_rows(db: Database) -> None:
+    now = utcnow()
+    proxy = await _add_proxy(db, server="1.0.0.9", secret="dd" + "bb" * 16)
+    await _ready(db, proxy.id, score="60.000", now=now)
+    fail = PublishResult(
+        ok=False, telegram_message_id=None, error_safe="timeout", retryable=True
+    )
+    publisher = FakeTelegramPublisher(results=[fail, fail])
+    service = _service(
+        db,
+        publisher,
+        telegram_publication_interval_seconds=1,
+        telegram_retry_base_seconds=1,
+        telegram_max_retries=8,
+    )
+    await service.publish_cycle(as_of=now, limit=5, now=now)
+    later = now + timedelta(seconds=2)
+    await service.publish_cycle(as_of=later, limit=5, now=later)
+    async with db.session_scope() as session:
+        rows = (await session.execute(select(ProxyPublication))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == PublicationStatus.PENDING
+    assert rows[0].attempt_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_pending_threshold_blocks_new_enqueues(db: Database) -> None:
+    now = utcnow()
+    first = await _add_proxy(db, server="1.1.1.1")
+    second = await _add_proxy(db, server="1.0.0.1", secret="dd" + "cc" * 16)
+    await _ready(db, first.id, score="90.000", now=now)
+    await _ready(db, second.id, score="80.000", now=now)
+    publisher = FakeTelegramPublisher(
+        results=[
+            PublishResult(ok=False, telegram_message_id=None, error_safe="timeout", retryable=True)
+        ]
+    )
+    service = _service(
+        db,
+        publisher,
+        telegram_publication_interval_seconds=1,
+        telegram_publication_max_pending=1,
+        telegram_retry_base_seconds=60,
+        telegram_max_retries=8,
+    )
+    first_tick = await service.publish_cycle(as_of=now, limit=10, now=now)
+    assert first_tick.retried == 1
+    later = now + timedelta(seconds=2)
+    second_tick = await service.publish_cycle(as_of=later, limit=10, now=later)
+    assert second_tick.published == 0
+    async with db.session_scope() as session:
+        rows = (await session.execute(select(ProxyPublication))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].proxy_id == first.id
+
+
+@pytest.mark.asyncio
+async def test_schedule_state_survives_a_new_service_instance(db: Database) -> None:
+    now = utcnow()
+    first = await _add_proxy(db, server="1.1.1.1")
+    second = await _add_proxy(db, server="9.9.9.9", secret="dd" + "dd" * 16)
+    await _ready(db, first.id, score="90.000", now=now)
+    await _ready(db, second.id, score="80.000", now=now)
+    await _service(
+        db, FakeTelegramPublisher(), telegram_publication_interval_seconds=300
+    ).publish_cycle(as_of=now, limit=10, now=now)
+    restarted = _service(db, FakeTelegramPublisher(), telegram_publication_interval_seconds=300)
+    blocked = await restarted.publish_cycle(as_of=now, limit=10, now=now)
+    assert blocked.published == 0
+    async with db.session_scope() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(ProxyPublication))
+        ).scalar_one()
+        stamp = (await session.execute(select(PublicationSchedule.last_scheduled_at))).scalar_one()
+    assert count == 1
+    assert stamp == now
+
+
+@pytest.mark.asyncio
+async def test_two_sessions_cannot_both_open_the_cadence_slot(db: Database) -> None:
+    now = utcnow()
+    first = await _add_proxy(db, server="1.1.1.1")
+    second = await _add_proxy(db, server="1.0.0.1", secret="dd" + "ee" * 16)
+    await _ready(db, first.id, score="90.000", now=now)
+    await _ready(db, second.id, score="80.000", now=now)
+    service = _service(db, FakeTelegramPublisher())
+    report = await service.reporting.select_top(limit=10, as_of=now)
+    items = list(report.items)
+    assert len(items) == 2
+    async with db.session_scope() as session:
+        session.add(PublicationSchedule(channel_id=CHANNEL, last_scheduled_at=None))
+
+    left = db.session()
+    right = db.session()
+    try:
+        scheduled_left = await schedule_new_publications(
+            left,
+            items,
+            channel_id=CHANNEL,
+            interval_seconds=300,
+            now=now,
+        )
+        scheduled_right = await asyncio.wait_for(
+            schedule_new_publications(
+                right,
+                items,
+                channel_id=CHANNEL,
+                interval_seconds=300,
+                now=now,
+            ),
+            timeout=5.0,
+        )
+        assert len(scheduled_left) == 1
+        assert scheduled_right == []
+        await left.commit()
+        await right.commit()
+    finally:
+        await left.close()
+        await right.close()
+
+    async with db.session_scope() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(ProxyPublication))
+        ).scalar_one()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_reorder_select_top(db: Database) -> None:
+    now = utcnow()
+    low = await _add_proxy(db, server="1.0.0.1", secret="dd" + "01" * 16)
+    high = await _add_proxy(db, server="1.1.1.1")
+    await _ready(db, low.id, score="10.000", now=now)
+    await _ready(db, high.id, score="99.000", now=now)
+    service = _service(db, FakeTelegramPublisher(), telegram_publication_interval_seconds=60)
+    report = await service.reporting.select_top(limit=10, as_of=now)
+    assert [item.proxy_id for item in report.items] == [high.id, low.id]
+    async with db.session_scope() as session:
+        scheduled = await schedule_new_publications(
+            session,
+            list(report.items),
+            channel_id=CHANNEL,
+            interval_seconds=60,
+            now=now,
+        )
+    assert [item.proxy_id for item in scheduled] == [high.id]

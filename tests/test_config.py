@@ -479,6 +479,33 @@ class TestPublisherSettings:
         with pytest.raises(ValidationError, match="telegram_retry_max_seconds"):
             make_settings(telegram_retry_base_seconds=30, telegram_retry_max_seconds=5)
 
+    def test_schedule_defaults(self) -> None:
+        settings = make_settings()
+        assert settings.telegram_publication_interval_seconds == 300.0
+        assert settings.telegram_publication_dedup_seconds == 86400.0
+        assert settings.telegram_publication_max_pending == 20
+
+    def test_schedule_overrides_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TELEGRAM_PUBLICATION_INTERVAL_SECONDS", "120")
+        monkeypatch.setenv("TELEGRAM_PUBLICATION_DEDUP_SECONDS", "3600")
+        monkeypatch.setenv("TELEGRAM_PUBLICATION_MAX_PENDING", "5")
+        settings = build_settings(env_file=None)
+        assert settings.telegram_publication_interval_seconds == 120.0
+        assert settings.telegram_publication_dedup_seconds == 3600.0
+        assert settings.telegram_publication_max_pending == 5
+
+    def test_rejects_non_positive_interval(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(telegram_publication_interval_seconds=0)
+
+    def test_rejects_negative_dedup(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(telegram_publication_dedup_seconds=-1)
+
+    def test_rejects_non_positive_max_pending(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(telegram_publication_max_pending=0)
+
 
 class TestApiBind:
     def test_defaults_to_loopback_8080(self) -> None:

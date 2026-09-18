@@ -8,6 +8,45 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 016 — Publication scheduling and deduplication
+
+### D-050 · DB cadence slot; unique identity stays; no independent selection
+
+**Context.** `select_top` can return many proxies at once. Posting them in
+one tick would burst the channel. Unique `(proxy_id, channel_id)` already
+prevents a second outbox *row*; it is not a time-based spam window, and
+014 retry must keep using that same row.
+
+**Decision.**
+
+1. **Pipeline.** `select_top` → `validate_publication` → formatter →
+   `PublicationScheduler` → outbox claim/send. The scheduler does not
+   score, rank, or invent proxies. It consumes the validated list in
+   caller order and takes at most one new insert per open cadence slot.
+2. **Cadence.** `TELEGRAM_PUBLICATION_INTERVAL_SECONDS` (default 300).
+   State is `publication_schedules.last_scheduled_at` (PostgreSQL), not a
+   process-local clock. Two workers `SELECT … FOR UPDATE SKIP LOCKED`
+   the channel row so they cannot both open the slot.
+3. **Dedup.** `TELEGRAM_PUBLICATION_DEDUP_SECONDS` (default 86400) plus
+   any existing outbox row. Conservative: a successfully published proxy
+   is not republished. Rotation after a window would require dropping the
+   unique identity; 016 does not.
+4. **Backpressure.** `TELEGRAM_PUBLICATION_MAX_PENDING` (default 20).
+   When pending+sending is at the cap, no new rows. 014 still processes
+   the existing outbox.
+5. **Failures.** Do not insert a second row. Retry/backoff stay D-048.
+6. **Claim/Telegram.** Unchanged. No real Telegram in tests.
+
+**Evidence.** Unit tests pin candidate order, existing-row skip, lock SQL.
+Integration tests cover interval, pending cap, restart, concurrent
+workers, and “failed send still one row”.
+
+**Consequences.** A tick may publish at most one *new* proxy while still
+retrying due pending rows. Operators who want faster rotation must
+change env knobs; 016 defaults stay conservative.
+
+---
+
 ## Task 015 — Publication quality and channel formatting
 
 ### D-049 · Validate then format; do not rescore; secret only in the canonical URL

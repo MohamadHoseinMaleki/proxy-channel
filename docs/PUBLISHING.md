@@ -12,6 +12,8 @@ validate_publication
         ↓
 PublicationFormatter
         ↓
+PublicationScheduler  (cadence / dedup / pending cap)
+        ↓
 PublishingService (outbox claim / send)
         ↓
 TelegramPublisher.publish(message)
@@ -34,6 +36,9 @@ scope. Scoring v1 and reporting selection are unchanged.
 | `TELEGRAM_MAX_RETRIES` | 8 | send attempts before `failed` |
 | `TELEGRAM_RETRY_BASE_SECONDS` | 2 | exponential base |
 | `TELEGRAM_RETRY_MAX_SECONDS` | 300 | backoff cap |
+| `TELEGRAM_PUBLICATION_INTERVAL_SECONDS` | 300 | min gap between *new* outbox inserts |
+| `TELEGRAM_PUBLICATION_DEDUP_SECONDS` | 86400 | recently published proxy is not re-enqueued |
+| `TELEGRAM_PUBLICATION_MAX_PENDING` | 20 | do not enqueue while pending+sending ≥ this |
 
 Neither value is hard-coded. The Bot API host is **not** configurable
 (`https://api.telegram.org` only) so a channel id cannot become an SSRF target.
@@ -98,9 +103,19 @@ It does not change scoring, ranking, or selection. Invalid items are logged
 ## Duplicate protection
 
 One outbox row per `(proxy_id, channel_id)`
-(`uq_proxy_publications_proxy_channel`). Re-running the worker does not
-enqueue a second row. Only `pending` rows whose lease is free are claimed
-(`FOR UPDATE SKIP LOCKED`).
+(`uq_proxy_publications_proxy_channel`). That identity is historical: a
+failed send is retried on the **same** row (Task 014). It is not a time
+window.
+
+Task 016 adds a **cadence** on new inserts (`publication_schedules`, one
+row per channel, `FOR UPDATE SKIP LOCKED`) and a **dedup window**
+(`TELEGRAM_PUBLICATION_DEDUP_SECONDS`). Default is conservative:
+successfully published proxies are not rotated back. The scheduler never
+picks top/highest/newest itself — it walks `select_top` order.
+
+Pending+sending is capped by `TELEGRAM_PUBLICATION_MAX_PENDING`. Existing
+outbox rows are still claimed and sent. The scheduler does not invent
+retries; 014 owns failures.
 
 ## Telegram Publishing Reliability
 
@@ -163,6 +178,9 @@ Do not claim exactly-once delivery to Telegram.
 | `created_at` | `TIMESTAMPTZ` |
 
 The channel message body (MTProto secret) is **not** stored.
+
+`publication_schedules` (migration `0004`): `channel_id` PK,
+`last_scheduled_at`, `created_at`. No secrets, no FK.
 
 ## Secrets
 

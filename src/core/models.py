@@ -1,6 +1,6 @@
 """SQLAlchemy 2.x async ORM models for the proxy intelligence schema.
 
-Five tables, five distinct jobs. Keeping them separate is the core of the design:
+Six tables, six distinct jobs. Keeping them separate is the core of the design:
 
 ======================  =========================================================
 Table                   Role
@@ -12,7 +12,8 @@ Table                   Role
                         successes *and* failures
 ``proxy_scores``        **calculated state** -- versioned snapshots derived from
                         observations
-``proxy_publications``  **audit** -- one row per Telegram publish attempt
+``proxy_publications``  **outbox** -- one row per ``(proxy_id, channel_id)``
+``publication_schedules`` **cadence** -- one row per channel, last enqueue slot
 ======================  =========================================================
 
 Nothing here performs I/O at import time. Timestamps are ``TIMESTAMPTZ`` with
@@ -78,6 +79,7 @@ __all__ = [
     "ProxyObservation",
     "ProxyPublication",
     "ProxyScore",
+    "PublicationSchedule",
     "PublicationStatus",
     "SourceType",
     "masked_secret_text",
@@ -793,4 +795,34 @@ class ProxyPublication(Base):
             f"<ProxyPublication id={self.id} proxy_id={self.proxy_id} "
             f"status={self.status} message_id={self.telegram_message_id} "
             f"attempts={self.attempt_count}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PublicationSchedule -- channel cadence (Task 016)
+# ---------------------------------------------------------------------------
+
+
+class PublicationSchedule(Base):
+    """One row per Telegram channel: when new outbox inserts last ran.
+
+    Survives worker restart. Claimed with ``FOR UPDATE SKIP LOCKED`` so two
+    publisher processes cannot open the same cadence slot. No secrets.
+    """
+
+    __tablename__ = "publication_schedules"
+    __table_args__ = (CheckConstraint("char_length(channel_id) > 0", name="channel_id_not_blank"),)
+
+    channel_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    last_scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PublicationSchedule channel_id={self.channel_id!r} "
+            f"last_scheduled_at={self.last_scheduled_at}>"
         )

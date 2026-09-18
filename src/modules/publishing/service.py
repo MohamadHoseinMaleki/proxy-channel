@@ -1,6 +1,7 @@
 """Publish :class:`~modules.reporting.models.Report` items via an outbox.
 
 Consumes Task 012 selection. Does not rescore, re-rank, or rewrite eligibility.
+Validated items pass through :class:`PublicationScheduler` before enqueue.
 Telegram I/O happens **outside** a database transaction after rows are claimed.
 """
 
@@ -27,6 +28,12 @@ from modules.publishing.backoff import (
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.formatter import format_channel_message
 from modules.publishing.protocol import PublishResult, TelegramPublisher
+from modules.publishing.scheduler import (
+    DEFAULT_DEDUP_SECONDS,
+    DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_MAX_PENDING,
+    PublicationScheduler,
+)
 from modules.publishing.validation import validate_publication
 from modules.reporting.models import Report, ReportItem
 from modules.reporting.service import ReportingService
@@ -88,6 +95,20 @@ class PublishingService:
         self.retry_max_seconds = (
             settings.telegram_retry_max_seconds if settings else DEFAULT_RETRY_MAX_SECONDS
         )
+        self.scheduler = PublicationScheduler(
+            channel_id=chat,
+            interval_seconds=(
+                settings.telegram_publication_interval_seconds
+                if settings
+                else DEFAULT_INTERVAL_SECONDS
+            ),
+            dedup_seconds=(
+                settings.telegram_publication_dedup_seconds if settings else DEFAULT_DEDUP_SECONDS
+            ),
+            max_pending=(
+                settings.telegram_publication_max_pending if settings else DEFAULT_MAX_PENDING
+            ),
+        )
 
     async def publish_cycle(
         self,
@@ -126,7 +147,8 @@ class PublishingService:
                 reason=check.reason,
             )
 
-        await self._enqueue(eligible, now=moment)
+        async with self.db.session_scope() as session:
+            await self.scheduler.enqueue(session, eligible, now=moment)
         recovered = await self._recover(now=moment)
 
         claimed: list[ProxyPublication] = []

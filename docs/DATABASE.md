@@ -58,14 +58,16 @@ rather than failing, so `uv run pytest` stays green everywhere.
 
 ## Schema overview
 
-Five tables, five responsibilities. They have different write rates, retention
-needs and deletion semantics, which is why they are separate (D-017, D-047).
+Six tables, six responsibilities. They have different write rates, retention
+needs and deletion semantics, which is why they are separate (D-017, D-047, D-050).
 
 ```
 proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
           ├──< proxy_observations   ON DELETE RESTRICT
           ├──< proxy_scores         ON DELETE CASCADE
           └──< proxy_publications   ON DELETE RESTRICT
+
+publication_schedules   (one row per channel; no FK)
 ```
 
 | Table | Role | Written by | Lifetime |
@@ -75,6 +77,7 @@ proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
 | `proxy_observations` | **measured behaviour** — one row per test attempt | tester | append-only; the asset |
 | `proxy_scores` | **derived state** — versioned snapshots | scorer | append-only history |
 | `proxy_publications` | **outbox** — one row per ``(proxy_id, channel_id)`` | publisher | lifecycle (D-048) |
+| `publication_schedules` | **cadence** — last new-insert slot per channel | publisher | D-050 |
 
 ### `proxies`
 
@@ -318,6 +321,7 @@ amplification.
 | `ix_proxy_publications_sending_lease` | `(lease_until) WHERE status = 'sending'` | stale-lease recovery |
 | `ix_proxy_publications_proxy_id` | `(proxy_id)` | audit by identity |
 | `ix_proxy_publications_created_at` | `(created_at)` | time-range sweeps |
+| `pk_publication_schedules` | `PRIMARY KEY (channel_id)` | publisher cadence slot |
 
 Notes worth knowing before changing any of them:
 

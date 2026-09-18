@@ -30,6 +30,7 @@ from core.models import (
     ProxyObservation,
     ProxyPublication,
     ProxyScore,
+    PublicationSchedule,
     PublicationStatus,
     SecretText,
     SourceType,
@@ -70,6 +71,7 @@ class TestMetadata:
             "proxy_observations",
             "proxy_scores",
             "proxy_publications",
+            "publication_schedules",
         }
 
     def test_no_module_level_engine_is_imported(self) -> None:
@@ -417,6 +419,35 @@ class TestPublicationConstraints:
         rendered = repr(row)
         assert "published" in rendered
         assert "secret=" not in rendered
+
+
+class TestPublicationSchedule:
+    def test_columns(self) -> None:
+        assert set(PublicationSchedule.__table__.columns.keys()) == {
+            "channel_id",
+            "last_scheduled_at",
+            "created_at",
+        }
+
+    def test_channel_id_is_primary_key(self) -> None:
+        column = PublicationSchedule.__table__.c.channel_id
+        assert column.primary_key is True
+        assert column.nullable is False
+        assert string_length(PublicationSchedule.__table__.c.channel_id) == 255
+
+    def test_channel_id_not_blank(self) -> None:
+        assert "char_length(channel_id) > 0" in ddl(PublicationSchedule.__table__)
+
+    def test_last_scheduled_at_is_nullable(self) -> None:
+        assert PublicationSchedule.__table__.c.last_scheduled_at.nullable is True
+
+    def test_no_foreign_keys(self) -> None:
+        assert list(PublicationSchedule.__table__.foreign_keys) == []
+
+    def test_repr_has_no_secret(self) -> None:
+        rendered = repr(PublicationSchedule(channel_id="@chan"))
+        assert "@chan" in rendered
+        assert "secret" not in rendered
 
 
 class TestScoreConstraints:
