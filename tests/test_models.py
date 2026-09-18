@@ -30,6 +30,7 @@ from core.models import (
     ProxyObservation,
     ProxyPublication,
     ProxyScore,
+    PublicationCounter,
     PublicationSchedule,
     PublicationStatus,
     PublisherHeartbeat,
@@ -74,6 +75,7 @@ class TestMetadata:
             "proxy_publications",
             "publication_schedules",
             "publisher_heartbeats",
+            "publication_counters",
         }
 
     def test_no_module_level_engine_is_imported(self) -> None:
@@ -455,29 +457,62 @@ class TestPublicationSchedule:
 class TestPublisherHeartbeat:
     def test_columns(self) -> None:
         assert set(PublisherHeartbeat.__table__.columns.keys()) == {
-            "worker_name",
+            "worker_id",
+            "worker_type",
             "last_seen_at",
-            "run_id",
             "created_at",
         }
 
-    def test_worker_name_is_primary_key(self) -> None:
-        column = PublisherHeartbeat.__table__.c.worker_name
+    def test_worker_id_is_primary_key(self) -> None:
+        column = PublisherHeartbeat.__table__.c.worker_id
         assert column.primary_key is True
         assert column.nullable is False
-        assert string_length(PublisherHeartbeat.__table__.c.worker_name) == 64
+        assert string_length(PublisherHeartbeat.__table__.c.worker_id) == 64
 
-    def test_worker_name_not_blank(self) -> None:
-        assert "char_length(worker_name) > 0" in ddl(PublisherHeartbeat.__table__)
+    def test_worker_id_not_blank(self) -> None:
+        assert "char_length(worker_id) > 0" in ddl(PublisherHeartbeat.__table__)
+        assert "char_length(worker_type) > 0" in ddl(PublisherHeartbeat.__table__)
 
     def test_no_foreign_keys(self) -> None:
         assert list(PublisherHeartbeat.__table__.foreign_keys) == []
 
     def test_repr_has_no_secret(self) -> None:
         rendered = repr(
-            PublisherHeartbeat(worker_name="publishing-worker", last_seen_at=datetime.now(UTC))
+            PublisherHeartbeat(
+                worker_id="abc123",
+                worker_type="publishing-worker",
+                last_seen_at=datetime.now(UTC),
+            )
         )
+        assert "abc123" in rendered
         assert "publishing-worker" in rendered
+        assert "secret" not in rendered
+
+
+class TestPublicationCounter:
+    def test_columns(self) -> None:
+        assert set(PublicationCounter.__table__.columns.keys()) == {
+            "name",
+            "channel_id",
+            "value",
+            "updated_at",
+        }
+
+    def test_composite_primary_key(self) -> None:
+        assert PublicationCounter.__table__.c.name.primary_key is True
+        assert PublicationCounter.__table__.c.channel_id.primary_key is True
+
+    def test_value_non_negative(self) -> None:
+        assert "value >= 0" in ddl(PublicationCounter.__table__)
+
+    def test_no_foreign_keys(self) -> None:
+        assert list(PublicationCounter.__table__.foreign_keys) == []
+
+    def test_repr_has_no_secret(self) -> None:
+        rendered = repr(
+            PublicationCounter(name="publication_success_total", channel_id="", value=3)
+        )
+        assert "publication_success_total" in rendered
         assert "secret" not in rendered
 
 

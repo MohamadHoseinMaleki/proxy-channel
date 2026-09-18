@@ -8,6 +8,47 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 018 — Persistent metrics and operational health
+
+### D-052 · Atomic counters; per-process heartbeat identity; health stays read-only
+
+**Context.** Task 017 counters were process-local and reset on restart.
+Heartbeats used `worker_name` as PK, so two publisher processes overwrote
+each other. There is still no Prometheus/OTel.
+
+**Decision.**
+
+1. **Counters.** `publication_counters` (migration `0006`): PK
+   `(name, channel_id)`, `channel_id=''` is the global total. Optional
+   per-channel rows. Atomic
+   `INSERT … ON CONFLICT DO UPDATE SET value = value + EXCLUDED.value`.
+   Known names only; no proxy_id / hostname / URI / error text.
+2. **Batching.** The 017 `PublicationMetrics` API is unchanged. Deltas are
+   flushed once per publish cycle, after publication work, in a separate
+   transaction. Persist failure is logged and **does not** change the
+   outbox or Telegram retry.
+3. **Heartbeat.** PK is `worker_id` (lifecycle `run_id`: stable for one
+   process, new after restart). `worker_type` is `publishing-worker`. No
+   hostname. A row existing is not health.
+4. **Health.** Still SELECT-only. Adds per-worker `healthy|stale`, system
+   `none|stale|healthy` (`healthy` only if at least one process is fresh),
+   and persistent counter totals. Never enqueue/retry/recover/claim/publish
+   or write counters/heartbeats.
+5. **Out of scope.** Scoring, ranking, `select_top`, validation, formatter,
+   scheduler, outbox claim/retry, Telegram semantics. No event-per-row log
+   table. Not an external monitoring backend.
+
+**Evidence.** Concurrent increment integration; restart persistence; metric
+persist failure leaves `published` intact; health snapshot does not mutate
+publications, schedules, heartbeats, or counters; 0006 preserves 0005
+publication rows.
+
+**Consequences.** Operators can sum totals across workers. Stale previous
+`run_id` rows remain after restart until they age out of the stale window
+as `stale` (not deleted).
+
+---
+
 ## Task 017 — Publication observability and health
 
 ### D-051 · In-process counters, read-only health, DB heartbeat; no retry change

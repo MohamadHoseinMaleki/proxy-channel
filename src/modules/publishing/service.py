@@ -27,7 +27,7 @@ from modules.publishing.backoff import (
 )
 from modules.publishing.claim import claim_due_publications, recover_stale_publications
 from modules.publishing.formatter import format_channel_message
-from modules.publishing.metrics import PublicationMetrics
+from modules.publishing.metrics import PublicationMetrics, persist_counter_deltas
 from modules.publishing.observe import (
     EVENT_FAILED,
     EVENT_PUBLISHED,
@@ -215,6 +215,7 @@ class PublishingService:
             recovered=len(recovered),
             retried=retried,
         )
+        await self._persist_metrics()
         return PublishCycleResult(
             selected=len(report.items),
             published=published,
@@ -224,6 +225,22 @@ class PublishingService:
             retried=retried,
             channel_id=self.channel_id,
         )
+
+    async def _persist_metrics(self) -> None:
+        """Flush in-process deltas. Failure must not change publication results."""
+        deltas = self.metrics.drain_deltas()
+        if not deltas:
+            return
+        try:
+            async with self.db.session_scope() as session:
+                await persist_counter_deltas(session, deltas, channel_id=self.channel_id)
+        except Exception as exc:
+            _logger.warning(
+                "publication_metrics_persist_failed",
+                channel_id=self.channel_id,
+                error=safe_error_message(exc),
+                classification=PublicationErrorClass.DATABASE,
+            )
 
     async def _enqueue(self, items: list[ReportItem], *, now: datetime) -> None:
         if not items:

@@ -125,8 +125,8 @@ async def _touch_heartbeat(life: WorkerLifecycle, db: Database) -> None:
         async with db.session_scope() as session:
             await touch_publisher_heartbeat(
                 session,
-                worker_name=WORKER_NAME,
-                run_id=life.run_id,
+                worker_id=life.run_id,
+                worker_type=WORKER_NAME,
                 interval_seconds=interval,
             )
     except Exception as exc:

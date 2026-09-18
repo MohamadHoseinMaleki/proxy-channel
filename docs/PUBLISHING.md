@@ -185,9 +185,17 @@ The channel message body (MTProto secret) is **not** stored.
 `publication_schedules` (migration `0004`): `channel_id` PK,
 `last_scheduled_at`, `created_at`. No secrets, no FK.
 
-`publisher_heartbeats` (migration `0005`): `worker_name` PK, `last_seen_at`,
-optional `run_id`. A row existing is **not** health; age of `last_seen_at`
-is. Health snapshots are **read-only** and never recover, claim, or publish.
+`publisher_heartbeats` (migration `0006`): `worker_id` PK (process identity,
+lifecycle `run_id`), `worker_type`, `last_seen_at`. A row existing is **not**
+health. After restart the new process gets a new `worker_id`; the previous
+row ages to stale.
+
+`publication_counters` (migration `0006`): PK `(name, channel_id)`.
+`channel_id=''` is the global total. Atomic `value = value + n`. Not an
+event log.
+
+Health snapshots are **read-only** and never recover, claim, publish, or
+write counters/heartbeats.
 
 ## Observability
 
@@ -199,11 +207,20 @@ plus an observability `classification` (`validation`, `telegram`, `database`,
 `configuration`, `transient`, `permanent`). Classification does **not** change
 retry (D-048).
 
-In-process counters (not Prometheus): scheduled, rejected, retries, failures,
-success, rate-limits. Gauges (pending/sending/published/failed, stale sending,
-oldest ages, last success/failure, heartbeat) come from PostgreSQL.
+Counters: in-process (Task 017 API) plus persistent `publication_counters`
+flushed once per cycle. Names: scheduled, rejected, retries, failures,
+success, rate-limits. Persist failure is logged and does not change the
+publication result.
 
-This is **not** production-grade monitoring: there is no metrics backend.
+Gauges (pending/sending/published/failed, stale sending, old pending,
+oldest ages, last success/failure, per-process heartbeat `none|stale|healthy`)
+come from PostgreSQL SELECTs.
+
+Stale pending detection: `TELEGRAM_PUBLICATION_STALE_PENDING_SECONDS` (default
+3600). Stale sending uses the existing lease (`lease_until`), not a second
+knob.
+
+This is **not** a full external monitoring backend: no Prometheus/OTel.
 
 ## Secrets
 

@@ -58,8 +58,8 @@ rather than failing, so `uv run pytest` stays green everywhere.
 
 ## Schema overview
 
-Seven tables, seven responsibilities. They have different write rates, retention
-needs and deletion semantics, which is why they are separate (D-017, D-047, D-050, D-051).
+Eight tables, eight responsibilities. They have different write rates, retention
+needs and deletion semantics, which is why they are separate (D-017, D-047, D-050, D-051, D-052).
 
 ```
 proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
@@ -68,7 +68,8 @@ proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
           └──< proxy_publications   ON DELETE RESTRICT
 
 publication_schedules   (one row per channel; no FK)
-publisher_heartbeats    (one row per publisher worker; no FK)
+publisher_heartbeats    (one row per publisher process; no FK)
+publication_counters    (atomic totals by name + channel_id; no FK)
 ```
 
 | Table | Role | Written by | Lifetime |
@@ -79,7 +80,8 @@ publisher_heartbeats    (one row per publisher worker; no FK)
 | `proxy_scores` | **derived state** — versioned snapshots | scorer | append-only history |
 | `proxy_publications` | **outbox** — one row per ``(proxy_id, channel_id)`` | publisher | lifecycle (D-048) |
 | `publication_schedules` | **cadence** — last new-insert slot per channel | publisher | D-050 |
-| `publisher_heartbeats` | **liveness** — last seen per publisher worker | publisher | D-051 |
+| `publisher_heartbeats` | **liveness** — last seen per publisher *process* | publisher | D-052 |
+| `publication_counters` | **telemetry** — monotonic operational totals | publisher | D-052 |
 
 ### `proxies`
 
@@ -324,7 +326,9 @@ amplification.
 | `ix_proxy_publications_proxy_id` | `(proxy_id)` | audit by identity |
 | `ix_proxy_publications_created_at` | `(created_at)` | time-range sweeps |
 | `pk_publication_schedules` | `PRIMARY KEY (channel_id)` | publisher cadence slot |
-| `pk_publisher_heartbeats` | `PRIMARY KEY (worker_name)` | publisher liveness |
+| `pk_publisher_heartbeats` | `PRIMARY KEY (worker_id)` | publisher process liveness |
+| `ix_publisher_heartbeats_worker_type` | `(worker_type)` | list publishers by type |
+| `pk_publication_counters` | `PRIMARY KEY (name, channel_id)` | atomic operational totals |
 
 Notes worth knowing before changing any of them:
 

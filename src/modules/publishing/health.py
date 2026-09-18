@@ -1,37 +1,63 @@
 """Read-only publication health and a throttled publisher heartbeat.
 
-The snapshot never INSERT/UPDATE/DELETE. Heartbeat writes are a separate
-function used by the publisher worker, not by health.
+The snapshot never INSERT/UPDATE/DELETE. Heartbeat writes and counter
+upserts are separate functions; health only SELECTs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models import ProxyPublication, PublicationStatus, PublisherHeartbeat, utcnow
+from modules.publishing.metrics import load_counters
 
 __all__ = [
     "DEFAULT_HEARTBEAT_SECONDS",
     "DEFAULT_HEARTBEAT_STALE_SECONDS",
     "DEFAULT_STALE_PENDING_SECONDS",
     "DEFAULT_WORKER_NAME",
+    "DEFAULT_WORKER_TYPE",
+    "HeartbeatState",
     "PublicationHealth",
     "PublicationHealthService",
+    "WorkerHeartbeatStatus",
     "heartbeat_is_stale",
+    "heartbeat_state",
+    "list_heartbeats_statement",
     "snapshot_status_statement",
     "stale_sending_count_statement",
     "touch_publisher_heartbeat",
 ]
 
 DEFAULT_WORKER_NAME = "publishing-worker"
+DEFAULT_WORKER_TYPE = DEFAULT_WORKER_NAME
 DEFAULT_HEARTBEAT_SECONDS = 60.0
 DEFAULT_HEARTBEAT_STALE_SECONDS = 180.0
 DEFAULT_STALE_PENDING_SECONDS = 3600.0
+
+HeartbeatState = Literal["none", "stale", "healthy"]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerHeartbeatStatus:
+    """One publisher process. ``status`` is healthy or stale, never none."""
+
+    worker_id: str
+    worker_type: str
+    last_seen_at: datetime
+    status: Literal["healthy", "stale"]
+
+    def __repr__(self) -> str:
+        return (
+            f"<WorkerHeartbeatStatus worker_id={self.worker_id!r} "
+            f"status={self.status} last_seen_at={self.last_seen_at}>"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +77,11 @@ class PublicationHealth:
     last_failed_publication_at: datetime | None
     heartbeat_last_seen_at: datetime | None
     heartbeat_stale: bool
+    heartbeat_state: HeartbeatState
+    heartbeats: tuple[WorkerHeartbeatStatus, ...]
+    healthy_publisher_count: int
+    stale_publisher_count: int
+    counters: dict[str, int]
     as_of: datetime
     worker_name: str
 
@@ -59,7 +90,7 @@ class PublicationHealth:
             f"<PublicationHealth channel_id={self.channel_id!r} "
             f"pending={self.pending_count} sending={self.sending_count} "
             f"published={self.published_count} failed={self.failed_count} "
-            f"heartbeat_stale={self.heartbeat_stale}>"
+            f"heartbeat_state={self.heartbeat_state}>"
         )
 
 
@@ -88,6 +119,11 @@ def stale_sending_count_statement(channel_id: str, now: datetime) -> Select[tupl
     )
 
 
+def list_heartbeats_statement(worker_type: str) -> Select[tuple[PublisherHeartbeat]]:
+    """All heartbeats of one worker type. SELECT only."""
+    return select(PublisherHeartbeat).where(PublisherHeartbeat.worker_type == worker_type)
+
+
 def heartbeat_is_stale(
     last_seen_at: datetime | None,
     *,
@@ -100,14 +136,25 @@ def heartbeat_is_stale(
     return now - last_seen_at >= timedelta(seconds=stale_seconds)
 
 
+def heartbeat_state(
+    views: tuple[WorkerHeartbeatStatus, ...],
+) -> HeartbeatState:
+    """System-level state. One existing row is not automatically healthy."""
+    if not views:
+        return "none"
+    if any(item.status == "healthy" for item in views):
+        return "healthy"
+    return "stale"
+
+
 class PublicationHealthService:
-    """Read-only snapshot of outbox + publisher heartbeat."""
+    """Read-only snapshot of outbox + publisher heartbeats + counters."""
 
     def __init__(
         self,
         *,
         channel_id: str,
-        worker_name: str = DEFAULT_WORKER_NAME,
+        worker_name: str = DEFAULT_WORKER_TYPE,
         stale_pending_seconds: float = DEFAULT_STALE_PENDING_SECONDS,
         heartbeat_stale_seconds: float = DEFAULT_HEARTBEAT_STALE_SECONDS,
     ) -> None:
@@ -159,13 +206,28 @@ class PublicationHealthService:
             or 0
         )
 
-        heartbeat_at = (
-            await session.execute(
-                select(PublisherHeartbeat.last_seen_at).where(
-                    PublisherHeartbeat.worker_name == self.worker_name
+        hb_rows = (
+            (await session.execute(list_heartbeats_statement(self.worker_name))).scalars().all()
+        )
+        views: list[WorkerHeartbeatStatus] = []
+        for beat in hb_rows:
+            stale = heartbeat_is_stale(
+                beat.last_seen_at, now=moment, stale_seconds=self.heartbeat_stale_seconds
+            )
+            views.append(
+                WorkerHeartbeatStatus(
+                    worker_id=beat.worker_id,
+                    worker_type=beat.worker_type,
+                    last_seen_at=beat.last_seen_at,
+                    status="stale" if stale else "healthy",
                 )
             )
-        ).scalar_one_or_none()
+        views_tuple = tuple(sorted(views, key=lambda item: item.worker_id))
+        state = heartbeat_state(views_tuple)
+        latest = max((item.last_seen_at for item in views_tuple), default=None)
+        healthy = sum(1 for item in views_tuple if item.status == "healthy")
+        stale_n = sum(1 for item in views_tuple if item.status == "stale")
+        counters = await load_counters(session, channel_id="")
 
         return PublicationHealth(
             channel_id=self.channel_id,
@@ -179,10 +241,13 @@ class PublicationHealthService:
             oldest_sending_age_seconds=_age(moment, oldest_created[PublicationStatus.SENDING]),
             last_successful_publication_at=latest_attempt[PublicationStatus.PUBLISHED],
             last_failed_publication_at=latest_attempt[PublicationStatus.FAILED],
-            heartbeat_last_seen_at=heartbeat_at,
-            heartbeat_stale=heartbeat_is_stale(
-                heartbeat_at, now=moment, stale_seconds=self.heartbeat_stale_seconds
-            ),
+            heartbeat_last_seen_at=latest,
+            heartbeat_stale=state != "healthy",
+            heartbeat_state=state,
+            heartbeats=views_tuple,
+            healthy_publisher_count=healthy,
+            stale_publisher_count=stale_n,
+            counters=counters,
             as_of=moment,
             worker_name=self.worker_name,
         )
@@ -191,26 +256,33 @@ class PublicationHealthService:
 async def touch_publisher_heartbeat(
     session: AsyncSession,
     *,
-    worker_name: str = DEFAULT_WORKER_NAME,
-    run_id: str | None = None,
+    worker_id: str,
+    worker_type: str = DEFAULT_WORKER_TYPE,
     interval_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
     now: datetime | None = None,
 ) -> bool:
-    """Write ``last_seen_at`` at most once per ``interval_seconds``.
+    """Write ``last_seen_at`` at most once per ``interval_seconds`` per process.
 
-    Returns whether a row was inserted or updated. ``interval_seconds <= 0``
-    disables writes.
+    ``worker_id`` is the process identity. ``interval_seconds <= 0`` disables.
     """
     if interval_seconds <= 0:
         return False
+    identity = worker_id.strip()
+    wtype = worker_type.strip()
+    if not identity:
+        msg = "worker_id must not be empty"
+        raise ValueError(msg)
+    if not wtype:
+        msg = "worker_type must not be empty"
+        raise ValueError(msg)
     moment = _aware(now)
     cutoff = moment - timedelta(seconds=interval_seconds)
     statement = (
         insert(PublisherHeartbeat)
-        .values(worker_name=worker_name, last_seen_at=moment, run_id=run_id)
+        .values(worker_id=identity, worker_type=wtype, last_seen_at=moment)
         .on_conflict_do_update(
-            index_elements=["worker_name"],
-            set_={"last_seen_at": moment, "run_id": run_id},
+            index_elements=["worker_id"],
+            set_={"last_seen_at": moment, "worker_type": wtype},
             where=PublisherHeartbeat.last_seen_at <= cutoff,
         )
     )

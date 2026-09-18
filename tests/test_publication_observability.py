@@ -18,11 +18,18 @@ from core.logger import REDACTED, get_logger
 from modules.publishing.health import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_HEARTBEAT_STALE_SECONDS,
+    WorkerHeartbeatStatus,
     heartbeat_is_stale,
+    heartbeat_state,
+    list_heartbeats_statement,
     snapshot_status_statement,
     stale_sending_count_statement,
 )
-from modules.publishing.metrics import PublicationMetrics
+from modules.publishing.metrics import (
+    PublicationMetrics,
+    increment_counters_statement,
+    load_counters_statement,
+)
 from modules.publishing.observe import (
     EVENT_FAILED,
     EVENT_PUBLISHED,
@@ -80,6 +87,20 @@ class TestMetrics:
         assert metrics.publication_success_total == 4
         assert metrics.telegram_rate_limits_total == 1
 
+    def test_drain_does_not_reset_totals(self) -> None:
+        metrics = PublicationMetrics()
+        metrics.inc_success(2)
+        metrics.inc_retries(1)
+        assert metrics.drain_deltas() == {
+            "publication_success_total": 2,
+            "publication_retries_total": 1,
+        }
+        assert metrics.publication_success_total == 2
+        assert metrics.drain_deltas() == {}
+        metrics.inc_success(1)
+        assert metrics.drain_deltas() == {"publication_success_total": 1}
+        assert metrics.publication_success_total == 3
+
 
 class TestClassification:
     def test_rate_limit_is_telegram_not_retry_policy(self) -> None:
@@ -129,6 +150,23 @@ class TestHeartbeatStale:
         assert DEFAULT_HEARTBEAT_SECONDS == 60.0
         assert DEFAULT_HEARTBEAT_STALE_SECONDS == 180.0
 
+    def test_system_state_is_not_healthy_just_because_a_row_exists(self) -> None:
+        assert heartbeat_state(()) == "none"
+        stale = WorkerHeartbeatStatus(
+            worker_id="a",
+            worker_type="publishing-worker",
+            last_seen_at=PINNED,
+            status="stale",
+        )
+        healthy = WorkerHeartbeatStatus(
+            worker_id="b",
+            worker_type="publishing-worker",
+            last_seen_at=PINNED,
+            status="healthy",
+        )
+        assert heartbeat_state((stale,)) == "stale"
+        assert heartbeat_state((stale, healthy)) == "healthy"
+
 
 class TestHealthSqlIsReadOnly:
     def test_status_snapshot_is_select(self) -> None:
@@ -152,6 +190,30 @@ class TestHealthSqlIsReadOnly:
         assert "INSERT" not in sql
         assert "UPDATE" not in sql
         assert "DELETE" not in sql
+
+    def test_heartbeats_and_counters_are_select(self) -> None:
+        compiled = list_heartbeats_statement("publishing-worker").compile(dialect=DIALECT)
+        hb = re.sub(r"\s+", " ", str(compiled)).upper()
+        counters = re.sub(
+            r"\s+", " ", str(load_counters_statement().compile(dialect=DIALECT))
+        ).upper()
+        for sql in (hb, counters):
+            assert sql.startswith("SELECT")
+            assert "INSERT" not in sql
+            assert "UPDATE" not in sql
+            assert "DELETE" not in sql
+            assert "FOR UPDATE" not in sql
+
+    def test_counter_upsert_is_atomic_add(self) -> None:
+        statement = increment_counters_statement(
+            {"publication_success_total": 2}, channel_id=CHANNEL, now=PINNED
+        )
+        assert statement is not None
+        sql = re.sub(r"\s+", " ", str(statement.compile(dialect=DIALECT))).upper()
+        assert "INSERT" in sql
+        assert "ON CONFLICT" in sql
+        assert "PUBLICATION_COUNTERS.VALUE" in sql or "VALUE +" in sql or "+ EXCLUDED" in sql
+        assert "PROXY_PUBLICATIONS" not in sql
 
 
 class TestPipelineIsolation:

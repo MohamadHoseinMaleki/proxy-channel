@@ -1,6 +1,6 @@
 """SQLAlchemy 2.x async ORM models for the proxy intelligence schema.
 
-Seven tables, seven distinct jobs. Keeping them separate is the core of the design:
+Eight tables, eight distinct jobs. Keeping them separate is the core of the design:
 
 ======================  =========================================================
 Table                   Role
@@ -14,7 +14,8 @@ Table                   Role
                         observations
 ``proxy_publications``  **outbox** -- one row per ``(proxy_id, channel_id)``
 ``publication_schedules`` **cadence** -- one row per channel, last enqueue slot
-``publisher_heartbeats`` **liveness** -- last seen time per publisher worker
+``publisher_heartbeats`` **liveness** -- last seen time per publisher process
+``publication_counters`` **telemetry** -- atomic monotonic operational totals
 ======================  =========================================================
 
 Nothing here performs I/O at import time. Timestamps are ``TIMESTAMPTZ`` with
@@ -836,26 +837,60 @@ class PublicationSchedule(Base):
 
 
 class PublisherHeartbeat(Base):
-    """Last time a publisher process wrote a heartbeat.
+    """Last time one publisher *process* wrote a heartbeat.
 
-    Existence of a row is **not** health: :mod:`modules.publishing.health`
-    treats a missing or stale ``last_seen_at`` as unhealthy. No secrets.
+    ``worker_id`` is the process identity (lifecycle ``run_id``): stable for
+    one process, new after restart. ``worker_type`` is ``publishing-worker``.
+    Existence of a row is **not** health. No hostname, no secrets.
     """
 
     __tablename__ = "publisher_heartbeats"
     __table_args__ = (
-        CheckConstraint("char_length(worker_name) > 0", name="worker_name_not_blank"),
+        CheckConstraint("char_length(worker_id) > 0", name="worker_id_not_blank"),
+        CheckConstraint("char_length(worker_type) > 0", name="worker_type_not_blank"),
+        Index("ix_publisher_heartbeats_worker_type", "worker_type"),
     )
 
-    worker_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    worker_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    worker_type: Mapped[str] = mapped_column(String(64), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     def __repr__(self) -> str:
         return (
-            f"<PublisherHeartbeat worker_name={self.worker_name!r} "
-            f"last_seen_at={self.last_seen_at}>"
+            f"<PublisherHeartbeat worker_id={self.worker_id!r} "
+            f"worker_type={self.worker_type!r} last_seen_at={self.last_seen_at}>"
+        )
+
+
+class PublicationCounter(Base):
+    """Atomic monotonic operational counter. Not an event log.
+
+    ``channel_id=''`` is the global total. Optional per-channel rows share the
+    same names. No proxy_id, hostname, URI, or error text.
+    """
+
+    __tablename__ = "publication_counters"
+    __table_args__ = (
+        CheckConstraint("char_length(name) > 0", name="name_not_blank"),
+        CheckConstraint("value >= 0", name="value_non_negative"),
+    )
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(
+        String(255), primary_key=True, default="", server_default=text("''")
+    )
+    value: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PublicationCounter name={self.name!r} channel_id={self.channel_id!r} "
+            f"value={self.value}>"
         )

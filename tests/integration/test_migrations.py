@@ -201,7 +201,7 @@ class TestUpgrade:
     def test_records_the_revision(self, lifecycle_url: str) -> None:
         _run_alembic(lifecycle_url, "upgrade", "head")
         output = _run_alembic(lifecycle_url, "current")
-        assert "0005 (head)" in output
+        assert "0006 (head)" in output
 
     def test_no_drift_between_the_models_and_the_database(self, lifecycle_url: str) -> None:
         # The strongest single assertion available: regenerate a diff against the
@@ -303,6 +303,74 @@ class TestUpgrade:
             ("published", 77, None, 1),
             ("pending", None, "telegram_unavailable", 1),
         ]
+
+    def test_0006_keeps_existing_publication_rows(self, lifecycle_url: str) -> None:
+        from sqlalchemy import text as sql_text
+
+        _run_alembic(lifecycle_url, "downgrade", "base")
+        _run_alembic(lifecycle_url, "upgrade", "0005")
+
+        async def _seed_and_upgrade() -> tuple[str, str | None, str | None]:
+            engine = create_async_engine(lifecycle_url)
+            try:
+                async with engine.begin() as connection:
+                    proxy_id = (
+                        await connection.execute(
+                            sql_text(
+                                "INSERT INTO proxies (server, port, secret, fingerprint) "
+                                "VALUES ('tele.example.com', 443, 'ee00', :fp) RETURNING id"
+                            ),
+                            {"fp": "d" * 64},
+                        )
+                    ).scalar_one()
+                    await connection.execute(
+                        sql_text(
+                            "INSERT INTO proxy_publications "
+                            "(proxy_id, channel_id, status, telegram_message_id, attempt_count) "
+                            "VALUES (:pid, '@chan', 'published', 42, 1)"
+                        ),
+                        {"pid": proxy_id},
+                    )
+                    await connection.execute(
+                        sql_text(
+                            "INSERT INTO publisher_heartbeats "
+                            "(worker_name, last_seen_at, run_id) "
+                            "VALUES ('publishing-worker', now(), 'oldrun')"
+                        )
+                    )
+            finally:
+                await engine.dispose()
+
+            _run_alembic(lifecycle_url, "upgrade", "head")
+
+            engine = create_async_engine(lifecycle_url)
+            try:
+                async with engine.connect() as connection:
+                    status = (
+                        await connection.execute(sql_text("SELECT status FROM proxy_publications"))
+                    ).scalar_one()
+                    worker_id = (
+                        await connection.execute(
+                            sql_text("SELECT worker_id FROM publisher_heartbeats")
+                        )
+                    ).scalar_one()
+                    worker_type = (
+                        await connection.execute(
+                            sql_text("SELECT worker_type FROM publisher_heartbeats")
+                        )
+                    ).scalar_one()
+                    return (
+                        str(status),
+                        str(worker_id) if worker_id else None,
+                        (str(worker_type) if worker_type else None),
+                    )
+            finally:
+                await engine.dispose()
+
+        status, worker_id, worker_type = asyncio.run(_seed_and_upgrade())
+        assert status == "published"
+        assert worker_id == "oldrun"
+        assert worker_type == "publishing-worker"
 
 
 class TestDowngrade:
