@@ -15,7 +15,7 @@ SOCKS5, HTTP proxies, VLESS, VMess, Trojan, Xray or Shadowsocks.
 
 ---
 
-## ⚠️ Current status: Tasks 001–012 complete
+## ⚠️ Current status: Tasks 001–013 complete
 
 Discovery, testing, deterministic scoring, ranking, and a **read-only HTTP
 API** are implemented. All three tick workers do real work against PostgreSQL
@@ -46,7 +46,7 @@ scores are computed from persisted (often synthetic) observations. See
 | 010 | Tester timeouts, transport verification, lease-on-cancel | ✅ **complete** |
 | 011 | Production scoring engine (v1 formula, append-only snapshots) | ✅ **complete** |
 | 012 | Reporting & selection (publishable top-N, JSON/TXT) | ✅ **complete** |
-| 013 | Telegram publishing, AI content | ⬜ not started |
+| 013 | Telegram channel publishing (Bot API, duplicate-safe) | ✅ **complete** |
 | 014–025 | Config expansion, concurrency, tests, security, infra, acceptance | ⬜ not started |
 
 ---
@@ -83,11 +83,13 @@ src/
 │   ├── scheduling.py        # FOR UPDATE SKIP LOCKED claim primitive
 │   ├── ranking/             # latest-score ranking, secret-safe listings
 │   ├── reporting/           # publishable selection, JSON/TXT (D-046)
+│   ├── publishing/          # Telegram channel posts over select_top (D-047)
 │   └── api/                 # FastAPI adapter over RankingService
 └── workers/
     ├── discovery.py         # Process A — source fetch + upsert (D-042)
     ├── tester.py            # Process B — MTProto probe + observations
     ├── scorer.py            # Process C — deterministic ProxyScore snapshots
+    ├── publisher.py         # Process E — Telegram channel publishing
     └── api.py               # Process D — uvicorn ranking HTTP (not a tick loop)
 
 alembic/                     # async migrations; no DSN in alembic.ini
@@ -102,6 +104,7 @@ docs/TESTER.md               # three-phase probe, help.getConfig, Fake-TLS limit
 docs/SCORING.md              # v1 formula, confidence, recency, limitations
 docs/RANKING.md              # serving contract, eligibility, freshness, order
 docs/REPORTING.md            # publishable selection, JSON/TXT, recent-success
+docs/PUBLISHING.md           # Telegram Bot API publisher, duplicate protection
 docs/API.md                  # HTTP transport, health/ready, secret-free errors
 docs/DECISION_LOG.md         # every constraining decision, with evidence
 ```
@@ -224,8 +227,10 @@ case-insensitive and a `.env` file is read automatically.
 | `DISCOVERY_MAX_RESPONSE_BYTES`, `DISCOVERY_MAX_REDIRECTS` | `2 MiB`, `3` | body / redirect caps |
 | `DISCOVERY_CONCURRENCY` | `3` | bounded source fetches per tick |
 
-Telegram publisher and Qwen credentials are **not** defined yet — they arrive
-with later reporting tasks.
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHANNEL_ID` | *(unset)* | publisher idle until both are set |
+| `PUBLISHER_TIMEOUT_SECONDS`, `PUBLISHER_CONNECT_TIMEOUT_SECONDS` | `15`, `5` | Bot API HTTP bounds |
+
+Qwen credentials are **not** defined yet.
 
 ### Secrets
 

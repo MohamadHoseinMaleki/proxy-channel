@@ -58,13 +58,14 @@ rather than failing, so `uv run pytest` stays green everywhere.
 
 ## Schema overview
 
-Four tables, four responsibilities. They have different write rates, retention
-needs and deletion semantics, which is why they are separate (D-017).
+Five tables, five responsibilities. They have different write rates, retention
+needs and deletion semantics, which is why they are separate (D-017, D-047).
 
 ```
 proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
           ├──< proxy_observations   ON DELETE RESTRICT
-          └──< proxy_scores         ON DELETE CASCADE
+          ├──< proxy_scores         ON DELETE CASCADE
+          └──< proxy_publications   ON DELETE RESTRICT
 ```
 
 | Table | Role | Written by | Lifetime |
@@ -73,6 +74,7 @@ proxies ──┬──< proxy_discoveries    ON DELETE CASCADE
 | `proxy_discoveries` | **provenance** — where/when an identity was sighted | discovery | append-only |
 | `proxy_observations` | **measured behaviour** — one row per test attempt | tester | append-only; the asset |
 | `proxy_scores` | **derived state** — versioned snapshots | scorer | append-only history |
+| `proxy_publications` | **audit** — one row per Telegram publish attempt | publisher | append-only |
 
 ### `proxies`
 
@@ -311,6 +313,9 @@ amplification.
 | `ix_proxy_observations_success_observed_at` | `(observed_at) WHERE success` | latency aggregation |
 | `ix_proxy_scores_proxy_id_calculated_at` | `(proxy_id, calculated_at)` | latest score per proxy |
 | `ix_proxy_discoveries_*` | `(proxy_id)`, `(discovered_at)`, `(source_type)` | provenance lookups |
+| `uq_proxy_publications_success` | `(proxy_id, channel_id) WHERE status = 'success'` | one successful post per proxy per channel |
+| `ix_proxy_publications_proxy_id` | `(proxy_id)` | audit by identity |
+| `ix_proxy_publications_created_at` | `(created_at)` | time-range sweeps |
 
 Notes worth knowing before changing any of them:
 

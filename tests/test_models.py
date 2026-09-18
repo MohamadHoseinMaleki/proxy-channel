@@ -28,7 +28,9 @@ from core.models import (
     Proxy,
     ProxyDiscovery,
     ProxyObservation,
+    ProxyPublication,
     ProxyScore,
+    PublicationStatus,
     SecretText,
     SourceType,
     masked_secret_text,
@@ -67,6 +69,7 @@ class TestMetadata:
             "proxy_discoveries",
             "proxy_observations",
             "proxy_scores",
+            "proxy_publications",
         }
 
     def test_no_module_level_engine_is_imported(self) -> None:
@@ -241,6 +244,7 @@ class TestForeignKeys:
             (ProxyDiscovery, "CASCADE"),
             (ProxyObservation, "RESTRICT"),
             (ProxyScore, "CASCADE"),
+            (ProxyPublication, "RESTRICT"),
         ],
     )
     def test_on_delete_action(self, model: object, expected: str) -> None:
@@ -271,10 +275,15 @@ class TestForeignKeys:
         assert "delete" not in relationship.cascade
         assert relationship.passive_deletes is True
 
+    def test_publications_are_not_cascaded_in_the_orm(self) -> None:
+        relationship = Proxy.__mapper__.relationships["publications"]
+        assert "delete" not in relationship.cascade
+        assert relationship.passive_deletes is True
+
     def test_all_relationships_refuse_lazy_loading(self) -> None:
         # lazy="raise": under asyncio an implicit lazy load is a hidden round
         # trip that fails outright. Callers must choose selectinload/joinedload.
-        for model in (Proxy, ProxyDiscovery, ProxyObservation, ProxyScore):
+        for model in (Proxy, ProxyDiscovery, ProxyObservation, ProxyScore, ProxyPublication):
             for relationship in model.__mapper__.relationships.values():
                 assert relationship.lazy == "raise", f"{model.__name__}.{relationship.key}"
 
@@ -341,6 +350,52 @@ class TestObservationConstraints:
         )
         names = [c.name for c in index.columns]  # type: ignore[attr-defined]
         assert names == ["proxy_id", "observed_at"]
+
+
+class TestPublicationConstraints:
+    def test_columns(self) -> None:
+        assert set(ProxyPublication.__table__.columns.keys()) == {
+            "id",
+            "proxy_id",
+            "channel_id",
+            "status",
+            "telegram_message_id",
+            "error_message_safe",
+            "created_at",
+        }
+
+    def test_success_is_unique_per_proxy_and_channel(self) -> None:
+        index = index_by_name(ProxyPublication.__table__, "uq_proxy_publications_success")
+        rendered = index_ddl(index)
+        assert "UNIQUE" in rendered.upper() or index.unique is True  # type: ignore[attr-defined]
+        assert "WHERE status = 'success'" in rendered
+        names = [c.name for c in index.columns]  # type: ignore[attr-defined]
+        assert names == ["proxy_id", "channel_id"]
+
+    def test_status_and_outcome_checks(self) -> None:
+        rendered = ddl(ProxyPublication.__table__)
+        assert "status IN ('success', 'failure')" in rendered
+        assert "telegram_message_id IS NOT NULL" in rendered
+        assert "error_message_safe IS NOT NULL" in rendered
+        assert f"char_length(error_message_safe) <= {ERROR_MESSAGE_MAX_LENGTH}" in rendered
+
+    def test_status_is_varchar_not_a_native_enum(self) -> None:
+        column = ProxyPublication.__table__.c.status
+        assert isinstance(column.type, String)
+        assert "CREATE TYPE" not in ddl(ProxyPublication.__table__)
+
+    def test_publication_status_values(self) -> None:
+        assert set(PublicationStatus) == {PublicationStatus.SUCCESS, PublicationStatus.FAILURE}
+        value: str = PublicationStatus.SUCCESS
+        assert value == "success"
+
+    def test_repr_has_no_secret(self) -> None:
+        row = ProxyPublication(
+            proxy_id=1, channel_id="@chan", status="success", telegram_message_id=9
+        )
+        rendered = repr(row)
+        assert "success" in rendered
+        assert "secret" not in rendered.lower() or "secret=" not in rendered
 
 
 class TestScoreConstraints:

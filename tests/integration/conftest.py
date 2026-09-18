@@ -78,7 +78,13 @@ _TEST_URL = _resolve_test_url()
 
 #: Tables truncated between tests. Listed explicitly rather than discovered so a
 #: new table cannot quietly escape isolation.
-TABLES = ("proxy_scores", "proxy_observations", "proxy_discoveries", "proxies")
+TABLES = (
+    "proxy_publications",
+    "proxy_scores",
+    "proxy_observations",
+    "proxy_discoveries",
+    "proxies",
+)
 
 
 def _run_alembic(database_url: str, *arguments: str, allow_failure: bool = False) -> str:

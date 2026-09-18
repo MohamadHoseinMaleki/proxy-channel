@@ -8,6 +8,47 @@ Format: **ID · Decision · Context · Evidence · Consequences**
 
 ---
 
+## Task 013 — Telegram channel publishing
+
+### D-047 · Publish Task 012 selection via Bot API; unique success per channel
+
+**Context.** Task 012 ships `ReportingService.select_top` as the publisher-facing
+contract (D-046). Task 013 must post that list to a Telegram channel without
+rescoring, without Qwen, and without a public API.
+
+**Decision.**
+
+1. **Separate process.** `mtproto-publisher` on `WorkerLifecycle`. Not merged
+   into discovery/tester/scorer or `mtproto-api`. Idle when
+   `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHANNEL_ID` is unset.
+2. **Layering.** `ReportingService.select_top` → `PublishingService` →
+   `TelegramPublisher.publish(message)` → Bot API. The HTTP client is not
+   imported by selection or message formatting.
+3. **Bot API, not Telethon.** Channel posts use `https://api.telegram.org`
+   (`httpx`). Telethon stays the MTProto tester. The API host is hard-coded.
+4. **Credentials from env.** Token is `SecretStr`. Channel id is a string.
+   Neither is hard-coded. Tests inject `FakeTelegramPublisher` or
+   `httpx.MockTransport`; they never send a real message.
+5. **Deterministic message.** Fixed field order, `str(Decimal)`, canonical
+   `tg://proxy?...` last line. No HTML parse mode.
+6. **Duplicates.** Append-only `proxy_publications`. Unique
+   `(proxy_id, channel_id) WHERE status = 'success'`. Failures may retry on a
+   later tick. One tick = at most one send per selected proxy.
+7. **Isolation.** Telegram I/O is outside a DB transaction. One failed post is
+   recorded (`error_message_safe`) and the batch continues. `CancelledError`
+   still propagates. Message body / secret is not persisted.
+8. **Out of scope.** Qwen, Cloudflare, public API, frontend, monetization,
+   scoring v1, reporting eligibility.
+
+**Evidence.** Unit tests cover message stability, Fake-TLS refusal, duplicate
+skip, per-item failure, Bot API mock transport, and token masking. Integration
+tests persist mixed success/failure against PostgreSQL with a fake publisher.
+
+**Consequences.** Ranking listings stay secret-free. Channel posts contain
+secrets by design (users need them) and must not be logged.
+
+---
+
 ## Task 012 — Proxy reporting and selection
 
 ### D-046 · Reporting is stricter than ranking; recent GetConfig success required

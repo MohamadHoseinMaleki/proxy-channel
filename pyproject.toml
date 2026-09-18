@@ -25,6 +25,7 @@ dependencies = [
 mtproto-discovery = "workers.discovery:main"
 mtproto-tester = "workers.tester:main"
 mtproto-scorer = "workers.scorer:main"
+mtproto-publisher = "workers.publisher:main"
 mtproto-api = "workers.api:main"
 
 [dependency-groups]

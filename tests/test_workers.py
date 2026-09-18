@@ -24,12 +24,18 @@ from core.lifecycle import WorkerLifecycle, run_worker
 
 from .conftest import make_settings
 
-WORKER_MODULES = ("workers.discovery", "workers.tester", "workers.scorer")
+WORKER_MODULES = (
+    "workers.discovery",
+    "workers.tester",
+    "workers.scorer",
+    "workers.publisher",
+)
 
 EXPECTED_WORKER_NAMES = {
     "workers.discovery": "discovery-worker",
     "workers.tester": "tester-worker",
     "workers.scorer": "scoring-worker",
+    "workers.publisher": "publishing-worker",
 }
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,7 +83,7 @@ class TestEntrypointContract:
 
     def test_worker_names_are_distinct(self) -> None:
         names = [load(name).WORKER_NAME for name in WORKER_MODULES]
-        assert len(set(names)) == 3
+        assert len(set(names)) == len(WORKER_MODULES)
 
     @pytest.mark.parametrize("name", WORKER_MODULES)
     def test_module_is_runnable_as_a_script(self, name: str) -> None:
@@ -330,6 +336,48 @@ class TestWorkerResourceOwnership:
         fake_db.dispose.assert_awaited()
 
 
+class TestPublisherWorker:
+    async def test_unconfigured_tick_is_honest(
+        self, fast_settings: Settings, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        import workers.publisher as publisher_module
+
+        async with WorkerLifecycle(publisher_module.WORKER_NAME, settings=fast_settings) as life:
+            await publisher_module.tick(life)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        ticks = [r for r in records if r["event"] == "publisher_tick"]
+        assert len(ticks) == 1
+        assert ticks[0]["implemented"] is True
+        assert ticks[0]["skipped"] == "unconfigured"
+        assert ticks[0]["published"] == 0
+        assert life.failure_count == 0
+
+    async def test_publisher_worker_tick_when_db_unreachable(
+        self, json_logs: pytest.CaptureFixture[str]
+    ) -> None:
+        import workers.publisher as publisher_module
+
+        settings = make_settings(
+            worker_poll_interval_seconds=0.001,
+            heartbeat_interval_seconds=0.0,
+            telegram_bot_token="123456789:AATestTokenNotARealSecretValue",
+            telegram_channel_id="@proxy_channel",
+        )
+        async with WorkerLifecycle(publisher_module.WORKER_NAME, settings=settings) as life:
+            await publisher_module.tick(life)
+
+        records = [
+            json.loads(line) for line in json_logs.readouterr().out.splitlines() if line.strip()
+        ]
+        warn_records = [r for r in records if r["event"] == "publisher_tick_db_unreachable"]
+        assert len(warn_records) == 1
+        assert warn_records[0]["worker"] == "publishing-worker"
+        assert life.failure_count == 0
+
+
 class TestConsoleScripts:
     def test_pyproject_declares_one_script_per_worker(self) -> None:
         import tomllib
@@ -342,6 +390,7 @@ class TestConsoleScripts:
             "mtproto-discovery": "workers.discovery:main",
             "mtproto-tester": "workers.tester:main",
             "mtproto-scorer": "workers.scorer:main",
+            "mtproto-publisher": "workers.publisher:main",
             "mtproto-api": "workers.api:main",
         }
 

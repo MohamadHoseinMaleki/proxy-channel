@@ -162,6 +162,16 @@ class Settings(BaseSettings):
     #: ``RECENT``. Capped at 24 h (v1 lookback); older success is not current.
     report_max_success_age_hours: float = Field(default=6.0, gt=0, le=24)
 
+    # --- Telegram channel publisher (Task 013) -----------------------------
+    #: Bot API token. ``None``/blank: the publisher worker ticks honestly
+    #: and posts nothing. Never hard-coded.
+    telegram_bot_token: SecretStr | None = Field(default=None)
+    #: Destination ``@channel`` or numeric chat id. Required together with
+    #: the token before any post is attempted.
+    telegram_channel_id: str | None = Field(default=None)
+    publisher_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    publisher_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
     # --- HTTP ranking API (Task 007) ---------------------------------------
     #: Loopback by default. Binding ``0.0.0.0`` is an operator choice, not the MVP.
     api_host: str = Field(default="127.0.0.1")
@@ -201,6 +211,25 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             value = value.strip()
             return value or "unset"
+        return value
+
+    @field_validator("telegram_bot_token", mode="before")
+    @classmethod
+    def _empty_bot_token_is_none(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("telegram_channel_id", mode="before")
+    @classmethod
+    def _normalise_channel_id(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
         return value
 
     @field_validator("api_host", mode="before")

@@ -196,11 +196,12 @@ class TestUpgrade:
         assert fk_actions(snapshot, "proxy_observations")[("proxy_id", "proxies")] == "RESTRICT"
         assert fk_actions(snapshot, "proxy_discoveries")[("proxy_id", "proxies")] == "CASCADE"
         assert fk_actions(snapshot, "proxy_scores")[("proxy_id", "proxies")] == "CASCADE"
+        assert fk_actions(snapshot, "proxy_publications")[("proxy_id", "proxies")] == "RESTRICT"
 
     def test_records_the_revision(self, lifecycle_url: str) -> None:
         _run_alembic(lifecycle_url, "upgrade", "head")
         output = _run_alembic(lifecycle_url, "current")
-        assert "0001 (head)" in output
+        assert "0002 (head)" in output
 
     def test_no_drift_between_the_models_and_the_database(self, lifecycle_url: str) -> None:
         # The strongest single assertion available: regenerate a diff against the
@@ -287,6 +288,7 @@ class TestOfflineMode:
         # control. It must not require a reachable server.
         output = _run_alembic(lifecycle_url, "upgrade", "head", "--sql")
         assert "CREATE TABLE proxies" in output
+        assert "CREATE TABLE proxy_publications" in output
         assert "CREATE UNIQUE INDEX uq_proxies_fingerprint" in output or (
             "UNIQUE" in output and "fingerprint" in output
         )

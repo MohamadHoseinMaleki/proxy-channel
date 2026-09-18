@@ -428,6 +428,36 @@ class TestReportingSettings:
             make_settings(report_max_success_age_hours=25)
 
 
+class TestPublisherSettings:
+    def test_defaults_are_unconfigured(self) -> None:
+        settings = make_settings()
+        assert settings.telegram_bot_token is None
+        assert settings.telegram_channel_id is None
+        assert settings.publisher_timeout_seconds == 15.0
+        assert settings.publisher_connect_timeout_seconds == 5.0
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:AATestTokenNotARealSecretValue")
+        monkeypatch.setenv("TELEGRAM_CHANNEL_ID", "@proxy_channel")
+        monkeypatch.setenv("PUBLISHER_TIMEOUT_SECONDS", "9")
+        settings = build_settings(env_file=None)
+        assert settings.telegram_bot_token is not None
+        assert settings.telegram_bot_token.get_secret_value().endswith("SecretValue")
+        assert settings.telegram_channel_id == "@proxy_channel"
+        assert settings.publisher_timeout_seconds == 9.0
+        assert "AATestTokenNotARealSecretValue" not in repr(settings)
+        assert settings.safe_dump()["telegram_bot_token"] == "**********"
+
+    def test_blank_token_and_channel_become_none(self) -> None:
+        settings = make_settings(telegram_bot_token="  ", telegram_channel_id="  ")
+        assert settings.telegram_bot_token is None
+        assert settings.telegram_channel_id is None
+
+    def test_rejects_non_positive_timeout(self) -> None:
+        with pytest.raises(ValidationError):
+            make_settings(publisher_timeout_seconds=0)
+
+
 class TestApiBind:
     def test_defaults_to_loopback_8080(self) -> None:
         settings = make_settings()

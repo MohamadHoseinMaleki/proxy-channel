@@ -6,8 +6,9 @@ the code that owns them (Task 003 onwards) so the SQL stays visible.
 
 Process model
 -------------
-The platform runs four independent OS processes (discovery, tester, scorer, and
-later publisher). Each builds **its own** :class:`Database` at startup and disposes
+The platform runs independent OS processes (discovery, tester, scorer,
+publisher, ranking API). Each tick worker builds **its own** :class:`Database`
+at startup and disposes
 it at shutdown. There is no module-level engine singleton: a global would be
 per-process anyway, but keeping it explicit removes any temptation to share state
 across processes and avoids binding a connection pool to an event loop that a

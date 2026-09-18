@@ -1,6 +1,6 @@
 """SQLAlchemy 2.x async ORM models for the proxy intelligence schema.
 
-Four tables, four distinct jobs. Keeping them separate is the core of the design:
+Five tables, five distinct jobs. Keeping them separate is the core of the design:
 
 ======================  =========================================================
 Table                   Role
@@ -12,6 +12,7 @@ Table                   Role
                         successes *and* failures
 ``proxy_scores``        **calculated state** -- versioned snapshots derived from
                         observations
+``proxy_publications``  **audit** -- one row per Telegram publish attempt
 ======================  =========================================================
 
 Nothing here performs I/O at import time. Timestamps are ``TIMESTAMPTZ`` with
@@ -74,7 +75,9 @@ __all__ = [
     "Proxy",
     "ProxyDiscovery",
     "ProxyObservation",
+    "ProxyPublication",
     "ProxyScore",
+    "PublicationStatus",
     "SourceType",
     "masked_secret_text",
     "utcnow",
@@ -193,6 +196,13 @@ class SourceType(StrEnum):
     RAW_TEXT = "raw_text"
     MANUAL = "manual"
     UNKNOWN = "unknown"
+
+
+class PublicationStatus(StrEnum):
+    """Outcome of one Telegram publish attempt. ``VARCHAR``, not a native enum."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +387,11 @@ class Proxy(Base):
         lazy="raise",
         passive_deletes=True,
         cascade="all, delete-orphan",
+    )
+    publications: Mapped[list[ProxyPublication]] = relationship(
+        back_populates="proxy",
+        lazy="raise",
+        passive_deletes=True,
     )
 
     @validates("secret")
@@ -676,4 +691,69 @@ class ProxyScore(Base):
         return (
             f"<ProxyScore id={self.id} proxy_id={self.proxy_id} score={self.score} "
             f"version={self.scoring_version} samples_24h={self.sample_count_24h}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ProxyPublication -- Telegram publish audit
+# ---------------------------------------------------------------------------
+
+
+class ProxyPublication(Base):
+    """One attempt to post a selected proxy to a Telegram channel.
+
+    Append-only. A successful post is unique per ``(proxy_id, channel_id)`` so
+    a publisher tick cannot spam the same identity. Failures are recorded and
+    may be retried on a later cycle. The message body (which contains the
+    MTProto secret) is **not** stored here.
+    """
+
+    __tablename__ = "proxy_publications"
+    __table_args__ = (
+        CheckConstraint("char_length(channel_id) > 0", name="channel_id_not_blank"),
+        CheckConstraint("status IN ('success', 'failure')", name="status_known"),
+        CheckConstraint(
+            "status <> 'success' OR telegram_message_id IS NOT NULL",
+            name="success_needs_message_id",
+        ),
+        CheckConstraint(
+            "status <> 'failure' OR error_message_safe IS NOT NULL",
+            name="failure_needs_error",
+        ),
+        CheckConstraint(
+            "error_message_safe IS NULL "
+            f"OR char_length(error_message_safe) <= {ERROR_MESSAGE_MAX_LENGTH}",
+            name="error_message_bounded",
+        ),
+        Index("ix_proxy_publications_proxy_id", "proxy_id"),
+        Index("ix_proxy_publications_created_at", "created_at"),
+        Index(
+            "uq_proxy_publications_success",
+            "proxy_id",
+            "channel_id",
+            unique=True,
+            postgresql_where=text("status = 'success'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    proxy_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("proxies.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    channel_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_message_safe: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    proxy: Mapped[Proxy] = relationship(back_populates="publications", lazy="raise")
+
+    def __repr__(self) -> str:
+        return (
+            f"<ProxyPublication id={self.id} proxy_id={self.proxy_id} "
+            f"status={self.status} message_id={self.telegram_message_id}>"
         )
